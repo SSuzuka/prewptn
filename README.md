@@ -311,6 +311,33 @@ uv sync --extra openai     # httpx, транспорт к OpenAI-совмест�
 
 ---
 
+## CI/CD (GitHub Actions)
+
+| Workflow | Триггер | Что делает |
+|---|---|---|
+| `ci.yml` | push в `main`, PR | `ruff check`, `ruff format --check`, `pytest` на Python 3.11 и 3.12 (офлайн, без инфраструктуры) |
+| `cd.yml` | push в `main`, теги `v*` | собирает `Dockerfile` и пушит образ в GHCR |
+
+Образ из `Dockerfile` (multi-stage, uv) содержит **оба** процесса — API и воркер;
+прод-extras (`redis`/`postgres`/`openai`) уже внутри. Теги: `main`/`latest`,
+semver-тег и короткий `sha`.
+
+```bash
+# API
+docker run --rm -p 8000:8000 --env-file .env ghcr.io/ssuzuka/prewptn:latest
+
+# Воркер — тот же образ, другая команда
+docker run --rm --env-file .env ghcr.io/ssuzuka/prewptn:latest \
+  taskiq worker aicore.broker:broker
+```
+
+Пуш в GHCR использует встроенный `GITHUB_TOKEN` — отдельных секретов не нужно
+(права `packages: write` выданы в workflow). Реальный деплой на хост — за
+пределами репозитория: берёте образ из GHCR и запускаете рядом с
+Postgres/Redis/Qdrant.
+
+---
+
 ## Design decisions и trade-offs
 
 **`RedisStreamBroker`, а не `ListQueueBroker` или `PubSubBroker`.** Из трёх
@@ -455,6 +482,9 @@ uop/
 ├── .env.example                     ✅ все переключатели с комментариями
 ├── .gitignore                       ✅
 ├── docker-compose.yml               ✅ лежит, но в MVP не запускается (см. комментарий в файле)
+├── Dockerfile                       ✅ образ API+воркер (сборка в GHCR)
+├── .dockerignore                    ✅
+├── .github/workflows/               ✅ ci.yml (lint+tests), cd.yml (сборка образа)
 ├── Makefile.ps1                     ✅ шпаргалка по командам
 ├── scripts/
 │   ├── demo.py                      ✅ демо: конфиг, логи, health-check
