@@ -1,6 +1,6 @@
 # AI Agent Platform — backend для AI/Agent-платформы
 
-[![CI](https://github.com/SSuzuka/prewptn/actions/workflows/ci.yml/badge.svg)](https://github.com/SSuzuka/prewptn/actions/workflows/ci.yml)
+[![CI/CD](https://github.com/SSuzuka/prewptn/actions/workflows/ci.yml/badge.svg)](https://github.com/SSuzuka/prewptn/actions/workflows/ci.yml)
 
 Backend-сервис, который принимает AI-задачу, проводит её через асинхронный
 **task-processing pipeline**, запускает **агентский workflow** (RAG + tools + MCP),
@@ -313,10 +313,19 @@ uv sync --extra openai     # httpx, транспорт к OpenAI-совмест�
 
 ## CI/CD (GitHub Actions)
 
-| Workflow | Триггер | Что делает |
+Один workflow `.github/workflows/ci.yml` с тремя джобами; порядок задаётся через
+`needs`, поэтому публикация образа не может обогнать тесты.
+
+| Job | Триггер | Что делает |
 |---|---|---|
-| `ci.yml` | push в `main`, PR | `ruff check`, `ruff format --check`, `pytest` на Python 3.11 и 3.12 (офлайн, без инфраструктуры) |
-| `cd.yml` | push в `main`, теги `v*` | собирает `Dockerfile` и пушит образ в GHCR |
+| `test` | push, PR | `ruff check`, `ruff format --check`, `pytest` на Python 3.11 и 3.12 (офлайн) |
+| `docker` | push, PR | сборка `Dockerfile` без пуша — ловит ошибки образа на PR |
+| `publish` | push в `main`/теги, `needs: [test, docker]` | собирает и пушит образ в GHCR |
+
+Почему так: отдельные workflow с одним триггером GitHub запускает **параллельно** —
+между файлами нет зависимостей, и CD мог опубликовать образ раньше (или вопреки)
+упавшим тестам. `needs` внутри одного workflow гарантирует, что `publish` стартует
+только после успешных `test` и `docker`.
 
 Образ из `Dockerfile` (multi-stage, uv) содержит **оба** процесса — API и воркер;
 прод-extras (`redis`/`postgres`/`openai`) уже внутри. Теги: `main`/`latest`,
@@ -484,7 +493,7 @@ uop/
 ├── docker-compose.yml               ✅ лежит, но в MVP не запускается (см. комментарий в файле)
 ├── Dockerfile                       ✅ образ API+воркер (сборка в GHCR)
 ├── .dockerignore                    ✅
-├── .github/workflows/               ✅ ci.yml (lint+tests), cd.yml (сборка образа)
+├── .github/workflows/               ✅ ci.yml: test → docker build → publish (GHCR)
 ├── Makefile.ps1                     ✅ шпаргалка по командам
 ├── scripts/
 │   ├── demo.py                      ✅ демо: конфиг, логи, health-check
