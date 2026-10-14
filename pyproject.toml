@@ -1,0 +1,69 @@
+[project]
+name = "aicore"
+version = "0.1.0"
+description = "Backend for an AI/Agent platform: async task pipeline, LangGraph agents, RAG, MCP, observability"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+
+# Версии заданы диапазонами по стабильным API-линиям; точные версии фиксируются в uv.lock.
+# Почему диапазоны, а не `==`: uv.lock даёт воспроизводимость, а диапазоны позволяют
+# получать патчи безопасности без правки манифеста. Верхние границы намеренно
+# исключают линии с breaking changes (см. README -> Design decisions).
+dependencies = [
+    "fastapi>=0.142,<0.143",      # 0.143.0 сделал OTel-экспортёры opt-in (breaking)
+    "uvicorn>=0.30,<0.55",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    "sqlalchemy>=2.0,<2.1",       # 2.1.x слишком свежая линия для async-стека
+    "aiosqlite>=0.20,<0.23",
+    "taskiq>=0.13,<0.14",
+    "sse-starlette>=3.0,<4",
+    "langchain>=1.0,<2",
+    "langgraph>=1.0,<2",
+    "qdrant-client>=1.10,<2",     # query_points API
+    "langfuse>=4.17,<5",          # OTel-based API; v5 вышел 2026-10-14 с breaking changes
+    "mcp>=1.28,<2",               # FastMCP API; в v2 модуль mcp.server.fastmcp удалён
+    "structlog>=24,<27",
+    "prometheus-client>=0.20,<1",
+    "opentelemetry-sdk>=1.27,<2",
+]
+
+[project.optional-dependencies]
+# Production-режим очереди. Не входит в базовые зависимости, чтобы `uv sync`
+# оставался лёгким: MVP работает на InMemoryBroker.
+redis = [
+    "taskiq-redis>=1.2,<2",
+]
+# Production-режим БД (PostgreSQL вместо SQLite).
+postgres = [
+    "asyncpg>=0.30,<0.33",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "httpx>=0.27,<0.29",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aicore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: требует внешней инфраструктуры (Postgres/Redis/Qdrant/LLM)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
