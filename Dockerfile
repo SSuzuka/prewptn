@@ -22,8 +22,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev \
         --extra redis --extra postgres --extra openai
 
-# Then the source and the project itself.
+# Then the source and the project itself. README.md is required: hatchling
+# reads it as the package readme while building the project metadata.
 COPY pyproject.toml uv.lock ./
+COPY README.md ./
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --extra redis --extra postgres --extra openai
