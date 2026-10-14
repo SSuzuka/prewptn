@@ -115,7 +115,21 @@ class TaskService:
     async def get_task_by_idempotency_key(
         self, key: str, *, scope: str = "default"
     ) -> TaskRun | None:
-        result = await self.session.execute(select(TaskRun).where(TaskRun.idempotency_key == key))
+        """Найти задачу по ключу идемпотентности В РАМКАХ СКОУПА.
+
+        Читаем через таблицу `idempotency_keys` по паре (key, scope) — это
+        источник правды для идемпотентности. Фильтр по `TaskRun.idempotency_key`
+        был бы неверным: две разные задачи в разных скоупах могут носить один
+        и тот же ключ.
+
+        Регресс, который тут ловился: раньше `scope` принимался, но не
+        использовался в запросе — ключ одного тенанта отдавал чужую задачу.
+        """
+        result = await self.session.execute(
+            select(TaskRun)
+            .join(IdempotencyKey, IdempotencyKey.task_id == TaskRun.id)
+            .where(IdempotencyKey.key == key, IdempotencyKey.scope == scope)
+        )
         return result.scalar_one_or_none()
 
     async def list_tasks(

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -56,9 +55,3 @@ def use_db(db: Database, monkeypatch: pytest.MonkeyPatch) -> Database:
 
     monkeypatch.setattr(session_module, "_database", db, raising=False)
     return db
-
-
-async def table_names(db: Database) -> set[str]:
-    async with db.session() as session:
-        rows = await session.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
-        return {row[0] for row in rows}

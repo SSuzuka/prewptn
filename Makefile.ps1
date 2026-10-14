@@ -28,8 +28,8 @@ uv sync --group dev                            # pytest, httpx
 # --- проверки --------------------------------------------------------------
 uv run python -c "import aicore; print('OK')"
 uv run pytest
-uv run ruff check src tests
-uv run ruff format --check src tests
+uv run ruff check src tests scripts
+uv run ruff format --check src tests scripts
 
 # --- запуск ----------------------------------------------------------------
 uv run python scripts/demo.py                  # демо: конфиг, логи, health-check

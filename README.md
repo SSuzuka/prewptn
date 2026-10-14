@@ -44,7 +44,7 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 95 тестов
+uv run pytest                        # 101 тест
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
 uv run python scripts/demo.py            # конфиг, логи, health-check
@@ -55,6 +55,9 @@ uv run python scripts/check_server.py    # поднимает uvicorn и бьё�
 
 > **Про `ruff`:** он объявлен в `[dependency-groups] dev`, поэтому нужен
 > `uv sync --group dev` (или `uv run ruff ...`, который подтянет группу сам).
+> Markdown намеренно исключён из форматирования (`exclude = ["*.md"]` в
+> `[tool.ruff]`): python-блоки в README выровнены по колонкам для читаемости,
+> а ruff снимает любое ручное выравнивание.
 >
 > **Про локальный прокси:** `check_server.py` намеренно использует opener с
 > пустым `ProxyHandler({})`. Иначе системные `HTTP_PROXY`/`HTTPS_PROXY` уводят
@@ -332,6 +335,16 @@ use_jitter=True, use_delay_exponent=True, max_delay_exponent=60)`. Jitter
 `completion_tokens`, `latency_ms` и `cost_usd` → Prometheus + Langfuse.
 Оптимизация latency и стоимости должна быть измеримой, иначе это не оптимизация.
 
+**Идемпотентность изолирована по скоупу.** Источник правды — таблица
+`idempotency_keys` с уникальностью по паре `(key, scope)`, а не глобальная
+уникальность ключа. Иначе два тенанта с одним `Idempotency-Key` схлопнулись бы
+в одну задачу, и ключ одного клиента отдавал бы чужую задачу. `TaskRun.idempotency_key`
+намеренно **не** уникален глобально — он для поиска и отладки.
+
+**Таймаут задачи.** `asyncio.timeout(task_timeout_seconds)` оборачивает всю
+обработку, включая задержки. Иначе одно зависшее задание утащило бы воркер в
+бесконечное ожидание. По истечении задача помечается failed с `TimeoutError`.
+
 **Langfuse 4.x на OpenTelemetry, а не 5.x.** API `get_client()` +
 `start_as_current_observation(as_type="generation")` присутствует уже в 4.x и
 хорошо знаком. Версия 5.0.1 вышла 14.10.2026 с breaking changes (`api.scores.create`
@@ -437,7 +450,9 @@ uop/
 │   ├── test_config_logging.py       ✅
 │   ├── test_api_health.py           ✅
 │   ├── test_db_schema.py            ✅
-│   └── test_task_service.py         ✅
+│   ├── test_task_service.py         ✅
+│   ├── test_idempotency_scope.py    ✅ изоляция по scope (регресс)
+│   └── test_broker.py               ✅
 └── evals/                           📋 датасет + раннер качества — фаза 2
 ```
 

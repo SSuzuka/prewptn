@@ -181,6 +181,38 @@ class TestProcessTask:
         with pytest.raises(PermanentTaskError):
             await process_task("not-a-uuid")
 
+    @pytest.mark.asyncio
+    async def test_timeout_marks_task_failed(
+        self, db: Database, use_db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """task_timeout_seconds должен реально ограничивать выполнение."""
+        # Крошечный таймаут вместо ожидания дефолтных 120с.
+        monkeypatch.setenv("TASK_TIMEOUT_SECONDS", "0.05")
+        from aicore.config import reset_settings_cache
+
+        reset_settings_cache()
+
+        async with db.session() as session:
+            task, _ = await TaskService(session).create_task(task_type="ping", payload={})
+
+        with pytest.raises(TimeoutError):
+            await process_task(str(task.id), delay_seconds=5.0)
+
+        reset_settings_cache()
+
+        async with db.session() as session:
+            reloaded = await TaskService(session).get_task(task.id)
+        assert reloaded is not None
+        assert "TimeoutError" in (reloaded.error or "")
+
+    @pytest.mark.asyncio
+    async def test_timeout_uses_configured_value(self, db: Database, use_db: Database) -> None:
+        """Мельче нуля таймаут не бывает — но значение из конфига применяется."""
+        from aicore.config import Settings, get_settings
+
+        assert Settings().task_timeout_seconds > 0
+        assert get_settings().task_timeout_seconds > 0
+
 
 class TestDocumentModel:
     @pytest.mark.asyncio

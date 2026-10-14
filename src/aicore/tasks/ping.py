@@ -11,6 +11,7 @@ from typing import Any
 from taskiq import TaskiqEvents
 
 from aicore.broker import broker
+from aicore.config import get_settings
 from aicore.db.session import get_database
 from aicore.logging import get_logger
 from aicore.tasks.service import TaskService, utcnow
@@ -41,6 +42,33 @@ async def process_task(
     Реальный бизнес-логикой (LLM, RAG) задача наполнится на этапах 3-5; сейчас
     здесь проверенный каркас управления состоянием.
     """
+    import asyncio
+
+    # task_timeout_seconds из конфига: без этого одно зависшее задание
+    # утащило бы воркер в бесконечное ожидание. Задержка тоже внутри timeout —
+    # иначе «медленная» задача успела бы отработать до применения лимита.
+    settings = get_settings()
+    db = get_database()
+
+    try:
+        async with asyncio.timeout(settings.task_timeout_seconds):
+            return await _run(task_id, fail_times=fail_times, delay_seconds=delay_seconds)
+    except TimeoutError:
+        logger.error("task.timeout", task_id=task_id, timeout=settings.task_timeout_seconds)
+        async with db.session() as session:
+            service = TaskService(session)
+            try:
+                task = await service.get_task(task_id)
+            except ValueError:
+                task = None
+            if task is not None:
+                await service.mark_failed(task, error="TimeoutError: task exceeded deadline")
+                await session.commit()
+        raise
+
+
+async def _run(task_id: str, *, fail_times: int, delay_seconds: float = 0.0) -> dict[str, Any]:
+    """Тело обработки задачи (вынесено, чтобы обернуть его в timeout)."""
     import asyncio
 
     if delay_seconds > 0:

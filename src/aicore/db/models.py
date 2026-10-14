@@ -111,11 +111,13 @@ class TaskRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
-    # Идемпотентность: повторный запрос с тем же ключом вернёт эту же задачу.
+    # Ключ идемпотентности для быстрого поиска/отладки. НЕ уникален глобально:
+    # уникальность живёт в `idempotency_keys` по паре (key, scope), поэтому
+    # разные тененты вправе использовать один и тот же ключ.
+    # Источник правды для проверки идемпотентности — таблица idempotency_keys.
     idempotency_key: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
-        unique=True,
         index=True,
     )
 

@@ -70,3 +70,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+# Markdown не форматируем: в README python-блоки намеренно выровнены по колонкам
+# для читаемости, а ruff снимает любое ручное выравнивание.
+exclude = ["*.md"]
