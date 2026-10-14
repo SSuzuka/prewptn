@@ -1,5 +1,7 @@
 # AI Agent Platform — backend для AI/Agent-платформы
 
+[![CI](https://github.com/SSuzuka/prewptn/actions/workflows/ci.yml/badge.svg)](https://github.com/SSuzuka/prewptn/actions/workflows/ci.yml)
+
 Backend-сервис, который принимает AI-задачу, проводит её через асинхронный
 **task-processing pipeline**, запускает **агентский workflow** (RAG + tools + MCP),
 стримит ход выполнения и отдаёт метрики по latency и стоимости LLM-вызовов.
