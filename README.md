@@ -4,17 +4,12 @@ Backend-сервис, который принимает AI-задачу, про�
 **task-processing pipeline**, запускает **агентский workflow** (RAG + tools + MCP),
 стримит ход выполнения и отдаёт метрики по latency и стоимости LLM-вызовов.
 
-Проект сделан под конкретную вакансию **«Python-разработчик (AI)»** и закрывает
-все её требования. Полная карта **«требование вакансии → файл»** —
-в разделе [Соответствие вакансии](#соответствие-вакансии).
-
 > **Статус реализации.** Легенда: ✅ реализовано · 🚧 в работе · 📋 запланировано.
 >
 > | Этап | Что | Статус |
 > |---|---|---|
 > | 0 | Каркас репозитория, пины, env-переключатели, README | ✅ |
-> | 8 | Smoke-тесты: импорты, наличие API, защита от breaking-линий | ✅ 38 passed |
-> | 1 | `config.py`, `logging.py`, health-check | 📋 |
+> | 1 | `config.py`, `logging.py`, health-check + live-сервер | ✅ |
 > | 2 | БД + брокер: статусы, retries, idempotency, DLQ | 📋 |
 > | 3 | LLM-слой: timeouts, rate limit, учёт токенов и стоимости | 📋 |
 > | 4 | RAG: chunking → embeddings → Qdrant → контекст | 📋 |
@@ -39,7 +34,8 @@ Docker, PostgreSQL, Redis, Qdrant и LLM-ключ **не требуются** �
 uv sync                              # venv + точные версии из uv.lock
 uv run python -c "import aicore"     # проверка, что пакет импортируется
 uv run pytest                        # тесты, 0 зависимостей от инфраструктуры
-uv run python scripts/demo.py        # e2e: индексация → RAG → агент → SSE-стрим
+uv run python scripts/check_stage1.py    # проверка config + logging
+uv run python scripts/check_server.py    # поднимает uvicorn и бьёт по API
 uv run uvicorn aicore.api.app:app --reload
 ```
 
@@ -53,32 +49,6 @@ Swagger UI: <http://127.0.0.1:8000/docs> · OpenAPI-схема: `/openapi.json`
 | uv | ≥0.5 | venv, зависимости, запуск | ✅ да |
 | git | любая | версионирование | ✅ да |
 | Docker Desktop | — | Postgres/Redis/Qdrant для prod-режима | ❌ нет |
-
----
-
-## Соответствие вакансии
-
-Каждый пункт ТЗ закрыт конкретным модулем — не «где-то в проекте», а файлом.
-
-| Требование вакансии | Где в коде | Статус |
-|---|---|---|
-| Разработка backend-сервисов для AI/Agent-платформы на Python | `src/aicore/api/` | ✅ каркас |
-| Асинхронный task-processing pipeline: постановка задач, очереди, воркеры, статусы, retries, idempotency | `broker.py`, `tasks/`, `db/models.py` | 📋 |
-| AI/LLM-интеграции и orchestration-логика: вызов моделей, обработка результатов, управление контекстом и состоянием задач | `llm/`, `agents/graph.py` | 📋 |
-| Построение агентских workflow (LangGraph / аналоги) | `agents/` | 📋 |
-| RAG-пайплайны: поиск контекста, embeddings/vector storage, формирование контекста для LLM | `rag/` | 📋 |
-| API на FastAPI, интеграция внутренних и внешних сервисов | `api/` | ✅ каркас |
-| PostgreSQL, Redis, Kafka/Redis Streams | `db/`, `broker.py`, `streaming/events.py` | 📋 |
-| Надёжность AI-задач: timeouts, retries, rate limiting, dead-letter handling, idempotency, fault tolerance | `llm/openai_compat.py`, `tasks/dlq.py`, `api/deps.py`, `broker.py` | 📋 |
-| Streaming ответов от AI-сервисов (SSE / WebSocket / Redis Streams) | `streaming/events.py`, `api/routes/agents.py` | 📋 |
-| Наблюдаемость: logging, metrics, tracing, Langfuse, анализ latency и стоимости LLM-вызовов | `logging.py`, `telemetry.py`, `llm/base.py`, `api/routes/metrics.py` | 📋 |
-| Участие в проектировании архитектуры микросервисов и распределённых систем | `docker-compose.yml`, [Design decisions](#design-decisions-и-trade-offs) | ✅ |
-| LLM-агенты: skills, memory, tool calling, многошаговые диалоговые сценарии | `agents/`, `tasks/skills.py` | 📋 |
-| Мультиагентность: взаимодействие между агентами | `agents/graph.py` (supervisor + подагенты) | 📋 |
-| MCP-серверы, подключение внешних и внутренних систем и инструментов | `mcp/server.py` | 📋 |
-| Evaluation, трассировка и метрики качества AI-систем | `evals/` | 📋 фаза 2 |
-| Оптимизация latency, стоимости, производительности, стабильности | `llm/base.py`, `streaming/`, Design decisions | 📋 |
-| Docker | `docker-compose.yml` | 📋 фаза 2 |
 
 ---
 
