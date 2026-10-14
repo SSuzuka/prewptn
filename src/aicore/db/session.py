@@ -53,6 +53,11 @@ class Database:
             raise RuntimeError("Database not initialised. Call `connect()` first.")
         return self._session_factory
 
+    @property
+    def is_connected(self) -> bool:
+        """True once `connect()` has built the engine."""
+        return self._engine is not None
+
     def _build_engine(self) -> AsyncEngine:
         """Создать движок с параметрами под конкретный диалект."""
         url = self.settings.db_url
@@ -118,6 +123,17 @@ class Database:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("db.schema_created", tables=sorted(Base.metadata.tables))
 
+    async def ensure_ready(self) -> None:
+        """Подключиться и создать схему один раз (удобство для dev/тестов).
+
+        Вызывается из API-зависимости и воркером, чтобы не требовать отдельного
+        startup-хука. Уже подключённая БД остаётся как есть (тесты подменяют
+        синглтон на готовую in-memory базу).
+        """
+        if self._engine is None:
+            await self.connect()
+            await self.create_all()
+
     async def drop_all(self) -> None:
         """Удалить все таблицы — только для тестов."""
         async with self.engine.begin() as conn:
@@ -177,7 +193,8 @@ def reset_database() -> None:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI-зависимость: отдаёт сессию из синглтона."""
+    """FastAPI-зависимость: отдаёт сессию из синглтона (с ленивым connect)."""
     db = get_database()
+    await db.ensure_ready()
     async with db.session() as session:
         yield session

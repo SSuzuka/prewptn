@@ -97,3 +97,9 @@ def build_broker(settings: Settings | None = None) -> AsyncBroker:
 
 
 broker = build_broker()
+
+# Регистрируем задачи на этом брокере. Импорт в конце файла — иначе цикл:
+# модули задач импортируют `broker` из этого модуля. Без этого воркер
+# (`taskiq worker aicore.broker:broker`) не знал бы ни одной задачи.
+from aicore.tasks import llm as _llm  # noqa: E402,F401
+from aicore.tasks import ping as _ping  # noqa: E402,F401

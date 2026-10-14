@@ -11,8 +11,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from aicore.api.routes import health
+from aicore.api.routes import health, metrics, tasks
 from aicore.config import get_settings
+from aicore.db.session import get_database
 from aicore.logging import configure_logging, get_correlation_id, get_logger
 from aicore.telemetry import configure_telemetry
 
@@ -34,6 +35,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         is_production=settings.is_production,
     )
     yield
+    db = get_database()
+    if db.is_connected:
+        await db.disconnect()
     logger.info("app.shutdown")
 
 
@@ -49,6 +53,8 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(health.router, tags=["health"])
+    app.include_router(tasks.router, prefix="/v1", tags=["tasks"])
+    app.include_router(metrics.router, tags=["metrics"])
 
     logger.info("app.configured", correlation_id=get_correlation_id())
     return app

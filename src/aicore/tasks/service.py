@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aicore.db.models import IdempotencyKey, TaskRun, TaskStatus
 from aicore.logging import get_logger
+from aicore.metrics import record_task_latency, record_task_status
 
 logger = get_logger(__name__)
 
@@ -152,6 +153,7 @@ class TaskService:
         task.attempts += 1
         task.started_at = utcnow()
         await self.session.flush()
+        record_task_status(task.task_type, task.status.value)
         logger.info(
             "task.running",
             task_id=str(task.id),
@@ -178,6 +180,10 @@ class TaskService:
         task.completion_tokens = completion_tokens
         task.cost_usd = cost_usd
         await self.session.flush()
+        record_task_status(task.task_type, task.status.value)
+        measured = latency_ms(task)
+        if measured is not None:
+            record_task_latency(task.task_type, measured)
         logger.info(
             "task.succeeded",
             task_id=str(task.id),
@@ -228,6 +234,7 @@ class TaskService:
             )
 
         await self.session.flush()
+        record_task_status(task.task_type, task.status.value)
         return task
 
     async def mark_cancelled(self, task: TaskRun) -> TaskRun:
@@ -235,6 +242,7 @@ class TaskService:
         task.status = TaskStatus.CANCELLED
         task.finished_at = utcnow()
         await self.session.flush()
+        record_task_status(task.task_type, task.status.value)
         logger.info("task.cancelled", task_id=str(task.id))
         return task
 
@@ -261,8 +269,14 @@ class TaskService:
 
 
 def latency_ms(task: TaskRun) -> int | None:
-    """Латентность обработки в миллисекундах."""
+    """Латентность обработки в миллисекундах.
+
+    Значения из БД могут прийти naive: SQLite не хранит таймзону, поэтому
+    после round-trip `started_at`/`finished_at` теряют tzinfo. Считаем такие
+    значения UTC, иначе вычитание aware и naive падает с TypeError.
+    """
     if task.started_at is None or task.finished_at is None:
         return None
-    delta = task.finished_at - task.started_at
-    return int(delta.total_seconds() * 1000)
+    started = task.started_at if task.started_at.tzinfo else task.started_at.replace(tzinfo=UTC)
+    finished = task.finished_at if task.finished_at.tzinfo else task.finished_at.replace(tzinfo=UTC)
+    return int((finished - started).total_seconds() * 1000)

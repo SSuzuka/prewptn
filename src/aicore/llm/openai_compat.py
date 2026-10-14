@@ -35,6 +35,7 @@ from aicore.llm.base import (
     run_with_retry,
 )
 from aicore.logging import get_logger
+from aicore.metrics import record_llm_call
 from aicore.telemetry import record_generation, span
 
 logger = get_logger(__name__)
@@ -88,6 +89,14 @@ class OpenAICompatibleLLM:
             cost_usd=response.cost_usd,
             latency_ms=response.latency_ms,
             metadata={"backend": "openai"},
+        )
+        record_llm_call(
+            backend="openai",
+            model=response.model,
+            prompt_tokens=response.usage.prompt_tokens,
+            completion_tokens=response.usage.completion_tokens,
+            cost_usd=response.cost_usd,
+            latency_ms=response.latency_ms,
         )
         return response
 

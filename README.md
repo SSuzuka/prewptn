@@ -17,12 +17,15 @@ Backend-сервис, который принимает AI-задачу, про�
 > | 4 | RAG: chunking → embeddings → Qdrant → контекст | 📋 |
 > | 5 | Агенты: `create_agent` + supervisor-граф на LangGraph | 📋 |
 > | 6 | MCP-сервер + монтирование в FastAPI | 📋 |
-> | 7 | API + SSE-стриминг + `/metrics` | 📋 |
+> | 7 | API + SSE-стриминг + `/metrics` | 🚧 срез |
 > | 9 | `evals/`: faithfulness / relevance / стоимость | 📋 фаза 2 |
 >
 > Тесты защищают от молчаливого ухода на breaking-линии: если uv подтянет
 > `fastapi 0.143+`, `langfuse 5+`, `mcp 2+` или `sqlalchemy 2.1+`, они упадут
 > (см. `tests/test_smoke_imports.py`).
+>
+> Реализован сквозной срез: `/v1/tasks` (создание/статус/retry), SSE-стриминг и
+> `/metrics` — офлайн, на StubLLM. RAG (этап 4), агенты (5) и MCP (6) отложены.
 
 ---
 
@@ -37,7 +40,7 @@ uv sync                              # venv + точные версии из uv.
 uv run python -c "import aicore"     # проверка, что пакет импортируется
 uv run pytest                        # тесты, 0 зависимостей от инфраструктуры
 uv run python scripts/check_stage1.py    # проверка config + logging
-uv run python scripts/check_server.py    # поднимает uvicorn и бьёт по API
+uv run python scripts/check_server.py    # uvicorn + сквозной путь задачи (POST/SSE/metrics)
 uv run uvicorn aicore.api.app:app --reload
 ```
 
@@ -46,14 +49,14 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 149 тестов
+uv run pytest                        # 169 тестов
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
 uv run python scripts/demo.py            # конфиг, логи, health-check
 uv run python scripts/check_stage1.py    # config + logging
 uv run python scripts/check_stage2.py    # БД, брокер, retries, DLQ
 uv run python scripts/check_stage3.py    # LLM: timeout, retries, токены, стоимость
-uv run python scripts/check_server.py    # поднимает uvicorn и бьёт по API
+uv run python scripts/check_server.py    # uvicorn + сквозной путь задачи (POST/SSE/metrics)
 ```
 
 > **Про `ruff`:** он объявлен в `[dependency-groups] dev`, поэтому нужен
@@ -132,18 +135,20 @@ Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> 
                                                       Langfuse (OTel)
 ```
 
-**Поток одной задачи, пошагово:**
+**Поток одной задачи, пошагово** (реализованный срез, без RAG и агентов):
 
 1. `POST /v1/tasks` с заголовком `Idempotency-Key` — повторный запрос с тем же
    ключом вернёт **существующую** задачу, а не создаст дубль и не сожжёт токены.
 2. Задача пишется в БД со статусом `pending` и уходит в очередь.
-3. Воркер забирает её, статус → `running`, события пишутся в Redis Streams.
-4. LangGraph-supervisor решает, какие подагенты вызвать (RAG и/или tools).
-5. LLM-вызов идёт через обёртку: `asyncio.timeout`, семафор на concurrency,
+3. Воркер забирает её, статус → `running` (в dev это InMemoryBroker в процессе).
+4. LLM-вызов идёт через обёртку: `asyncio.timeout`, семафор на concurrency,
    ретраи с backoff, фиксация `latency_ms` / токенов / `cost_usd`.
-6. Клиент читает прогресс через SSE, не удерживая соединение.
-7. Итог → `succeeded`. Если retries исчерпаны → `dead_letter` +
+5. Клиент читает прогресс через SSE (`GET /v1/tasks/{id}/stream`).
+6. Итог → `succeeded` (с метриками). Если retries исчерпаны → `dead_letter` +
    ручной `POST /v1/tasks/{id}/retry`.
+
+RAG (этап 4) и LangGraph-supervisor с подагентами (этап 5) в этот срез не входят —
+сейчас шаг 4 это прямой вызов LLM, а не агентский граф.
 
 ---
 
@@ -160,37 +165,38 @@ Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> 
 | `GET` | `/version` | версия сервиса | ✅ |
 | `GET` | `/openapi.json` | OpenAPI-схема | ✅ |
 | `GET` | `/docs` | Swagger UI | ✅ |
+| `POST` | `/v1/tasks` | постановка AI-задачи (идемпотентно, `Idempotency-Key`, rate limit) | ✅ |
+| `GET` | `/v1/tasks/{id}` | статус задачи + метрики LLM (токены, latency, `cost_usd`) | ✅ |
+| `GET` | `/v1/tasks/{id}/stream` | **SSE**-поток событий выполнения (`status`/`done`/`error`) | ✅ |
+| `POST` | `/v1/tasks/{id}/retry` | ручной перезапуск упавшей задачи | ✅ |
+| `GET` | `/metrics` | Prometheus-метрики (latency, счётчики, стоимость) | ✅ |
 
-**Целевой API (этапы 2–7):**
+**Целевой API (этапы 4–6):**
 
 | Метод | Путь | Назначение | Статус |
 |---|---|---|---|
-| `GET` | `/metrics` | Prometheus-метрики (latency, счётчики, стоимость) | 📋 этап 7 |
 | `POST` | `/v1/documents` | загрузка документа → задача индексации в RAG | 📋 этап 4 |
 | `GET` | `/v1/documents/{id}` | статус индексации документа | 📋 этап 4 |
-| `POST` | `/v1/tasks` | постановка AI-задачи (идемпотентно, `Idempotency-Key`) | 📋 этап 7 |
-| `GET` | `/v1/tasks/{id}` | статус: `pending` / `running` / `succeeded` / `failed` / `dead_letter` | 📋 этап 7 |
-| `GET` | `/v1/tasks/{id}/stream` | **SSE**-поток событий выполнения агента | 📋 этап 7 |
-| `POST` | `/v1/tasks/{id}/retry` | ручной перезапуск упавшей задачи | 📋 этап 7 |
 | `/mcp` | — | Streamable HTTP эндпоинт MCP-сервера | 📋 этап 6 |
 
-Проверить то, что уже есть:
+Сквозной сценарий (работает уже сейчас, офлайн):
 
 ```bash
 # Поднять сервер
 uv run uvicorn aicore.api.app:app --reload
 
-# Доступные сейчас эндпоинты
 curl -sS http://127.0.0.1:8000/health
-curl -sS http://127.0.0.1:8000/ready
-curl -sS http://127.0.0.1:8000/version
 
-# Пример целевого API (станет рабочим на этапе 7)
-#   curl -sS -X POST http://127.0.0.1:8000/v1/tasks \
-#     -H 'Content-Type: application/json' \
-#     -H 'Idempotency-Key: demo-001' \
-#     -d '{"question": "..."}'
-#   curl -N http://127.0.0.1:8000/v1/tasks/<id>/stream
+# Поставить задачу (идемпотентно), затем статус и SSE-поток
+curl -sS -X POST http://127.0.0.1:8000/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-001' \
+  -d '{"question": "Explain idempotency in one sentence"}'
+
+curl -sS http://127.0.0.1:8000/v1/tasks/<id>
+curl -N  http://127.0.0.1:8000/v1/tasks/<id>/stream
+
+curl -sS http://127.0.0.1:8000/metrics | grep aicore_
 ```
 
 ---
@@ -508,9 +514,13 @@ uop/
 │   ├── api/
 │   │   ├── app.py                   ✅ фабрика приложения + lifespan
 │   │   ├── __init__.py              ✅
+│   │   ├── schemas.py               ✅ Pydantic-схемы задач
+│   │   ├── deps.py                  ✅ rate limiting по клиенту
 │   │   └── routes/
 │   │       ├── __init__.py          ✅
-│   │       └── health.py            ✅ /health /ready /version
+│   │       ├── health.py            ✅ /health /ready /version
+│   │       ├── tasks.py             ✅ /v1/tasks (+retry, SSE)
+│   │       └── metrics.py           ✅ /metrics
 │   ├── broker.py                    ✅ InMemory | RedisStream + SmartRetryMiddleware
 │   ├── db/                          ✅ этап 2
 │   │   ├── __init__.py              ✅
@@ -520,8 +530,10 @@ uop/
 │   ├── tasks/                       ✅ этап 2
 │   │   ├── __init__.py              ✅
 │   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ
-│   │   └── ping.py                  ✅ задача-образец с ретраями
+│   │   ├── ping.py                  ✅ задача-образец с ретраями
+│   │   └── llm.py                   ✅ answer_question: LLM + метрики в TaskRun
 │   ├── telemetry.py                 ✅ OpenTelemetry + langfuse get_client() — этап 3
+│   ├── metrics.py                   ✅ Prometheus: счётчики/гистограммы задач и LLM
 │   ├── llm/                         ✅ этап 3
 │   │   ├── __init__.py              ✅ фабрика build_llm_client + синглтон
 │   │   ├── base.py                  ✅ LLMRequest/Response, ошибки, cost, retry-политика
@@ -533,10 +545,8 @@ uop/
 │   │   ├── state.py graph.py tools.py memory.py  # create_agent + supervisor
 │   ├── mcp/                         📋 этап 6
 │   │   └── server.py                     # FastMCP + streamable_http_app
-│   ├── api/routes/                  📋 этапы 4/6/7
-│   │   └── {documents,agents,tasks,metrics}.py
-│   └── streaming/                   📋 этап 7
-│       └── events.py                     # Redis Streams -> SSE
+│   └── streaming/                   ✅ этап 7 (срез)
+│       └── events.py                ✅ SSE: опрос TaskRun -> status/done/error
 ├── tests/                           ✅ pytest, без внешней инфраструктуры
 │   ├── conftest.py                  ✅ фикстуры (SQLite :memory: + StaticPool)
 │   ├── test_smoke_imports.py        ✅
@@ -551,7 +561,12 @@ uop/
 │   ├── test_llm_openai_compat.py    ✅ timeout/retry/семафор на MockTransport
 │   ├── test_llm_factory.py          ✅ выбор бэкенда + синглтон
 │   ├── test_llm_metrics_e2e.py      ✅ токены/$ сохраняются в TaskRun
-│   └── test_telemetry.py            ✅ no-op-safe OTel + langfuse
+│   ├── test_telemetry.py            ✅ no-op-safe OTel + langfuse
+│   ├── test_llm_task.py             ✅ LLM-задача: метрики, retry vs DLQ
+│   ├── test_api_tasks.py            ✅ API задач (создание/идемпотентность/retry)
+│   ├── test_streaming.py            ✅ SSE-поток по шагам
+│   ├── test_metrics.py              ✅ /metrics + инструментирование
+│   └── test_rate_limit.py           ✅ 429 после лимита
 └── evals/                           📋 датасет + раннер качества — фаза 2
 ```
 

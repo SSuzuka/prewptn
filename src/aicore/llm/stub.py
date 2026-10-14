@@ -23,6 +23,7 @@ from aicore.llm.base import (
     LLMUsage,
     compute_cost_usd,
 )
+from aicore.metrics import record_llm_call
 from aicore.telemetry import record_generation, span
 
 
@@ -87,6 +88,14 @@ class StubLLM:
                 cost_usd=response.cost_usd,
                 latency_ms=response.latency_ms,
                 metadata={"backend": "stub"},
+            )
+            record_llm_call(
+                backend="stub",
+                model=self.model,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                cost_usd=response.cost_usd,
+                latency_ms=response.latency_ms,
             )
             return response
 
