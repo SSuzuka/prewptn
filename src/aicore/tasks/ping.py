@@ -112,7 +112,13 @@ async def _run(task_id: str, *, fail_times: int, delay_seconds: float = 0.0) -> 
             # Сначала СОХРАНЯЕМ новое состояние, и только потом бросаем.
             # Иначе `db.session()` сделает rollback и attempts/статус потеряются.
             transient = isinstance(exc, TransientTaskError)
-            await service.mark_failed(task, error=f"{type(exc).__name__}: {exc}")
+            await service.mark_failed(
+                task,
+                error=f"{type(exc).__name__}: {exc}",
+                # Постоянная ошибка (PermanentTaskError и всё не-Transient) не
+                # ретраится: сразу в DEAD_LETTER, а не вечный PENDING.
+                retryable=transient,
+            )
             await session.commit()
 
             if transient and task.can_retry:

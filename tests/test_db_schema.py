@@ -24,6 +24,26 @@ class TestSchema:
         assert {"task_runs", "documents", "idempotency_keys"} <= await table_names(db)
 
     @pytest.mark.asyncio
+    async def test_all_datetime_columns_are_timezone_aware(self) -> None:
+        """Регресс: все DateTime-колонки должны быть tz=True.
+
+        `utcnow()` возвращает aware-datetime. Колонка без TZ на Postgres это
+        TIMESTAMP WITHOUT TIME ZONE, куда asyncpg aware-объект не положит
+        корректно. На SQLite расхождение маскируется, поэтому ловится только
+        проверкой метаданных.
+
+        Регресс: queued_at/started_at/finished_at/indexed_at были tz=False,
+        а created_at/updated_at — tz=True.
+        """
+        from aicore.db.models import Document, IdempotencyKey, TaskRun
+
+        for model in (TaskRun, Document, IdempotencyKey):
+            for column in model.__table__.columns:
+                if column.name.endswith("_at"):
+                    tz = getattr(column.type, "timezone", None)
+                    assert tz is True, f"{model.__tablename__}.{column.name} tz={tz}, ожидался True"
+
+    @pytest.mark.asyncio
     async def test_healthcheck_true(self, db: Database) -> None:
         assert await db.healthcheck() is True
 

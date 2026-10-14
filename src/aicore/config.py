@@ -122,12 +122,6 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {allowed}, got {value!r}")
         return upper
 
-    @field_validator("openai_api_key")
-    @classmethod
-    def _warn_openai_key_in_stub_mode(cls, value: str | None) -> str | None:
-        """Ключ допустим, но при llm_backend=stub он просто не используется."""
-        return value
-
     # -------------------------------------------------------------- свойства
     @property
     def langfuse_enabled(self) -> bool:

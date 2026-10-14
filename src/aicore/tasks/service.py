@@ -186,16 +186,30 @@ class TaskService:
         )
         return task
 
-    async def mark_failed(self, task: TaskRun, error: str) -> TaskRun:
+    async def mark_failed(
+        self,
+        task: TaskRun,
+        error: str,
+        *,
+        retryable: bool = True,
+    ) -> TaskRun:
         """Отметить неудачу. Если попытки исчерпаны — увести в dead-letter.
 
         Повторную постановку в очередь делает taskiq; здесь только фиксируем
         факт неудачной попытки и решаем, пора ли в DLQ.
+
+        `retryable=False` означает постоянную ошибку (например, 4xx от LLM):
+        ретрай бессмысленен, поэтому задача идёт сразу в DEAD_LETTER, даже если
+        попытки остались. Иначе без этого флага постоянная ошибка на первой
+        попытке вернула бы задачу в PENDING навсегда.
+
+        Регресс: раньше ветвление шло только по `task.can_retry`, и постоянная
+        ошибка с остатком попыток зацикливалась в PENDING.
         """
         task.error = error
         task.finished_at = utcnow()
 
-        if task.can_retry:
+        if retryable and task.can_retry:
             task.status = TaskStatus.PENDING
             logger.warning(
                 "task.attempt_failed_will_retry",
@@ -209,6 +223,7 @@ class TaskService:
                 "task.dead_lettered",
                 task_id=str(task.id),
                 attempts=task.attempts,
+                retryable=retryable,
                 error=error,
             )
 
@@ -224,7 +239,17 @@ class TaskService:
         return task
 
     async def reset_for_retry(self, task: TaskRun) -> TaskRun:
-        """Подготовить dead-letter задачу к ручному перезапуску."""
+        """Подготовить задачу к ручному перезапуску.
+
+        Перезапускать имеет смысл только задачу, завершившуюся неудачей:
+        FAILED или DEAD_LETTER. SUCCEEDED трогать нельзя (результат уже
+        отдан клиенту), а RUNNING/PENDING перезапуск только сломает.
+        """
+        if task.status not in {TaskStatus.FAILED, TaskStatus.DEAD_LETTER}:
+            raise ValueError(
+                f"cannot reset task {task.id}: status {task.status.value} is not retryable"
+            )
+
         task.status = TaskStatus.PENDING
         task.attempts = 0
         task.error = None

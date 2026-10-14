@@ -104,6 +104,23 @@ class TestRetriesAndDeadLetter:
             assert [t.id for t in await svc.list_dead_letters()] == [task.id]
 
     @pytest.mark.asyncio
+    async def test_permanent_error_skips_remaining_attempts(self, db: Database) -> None:
+        """Постоянная ошибка идёт в DLQ сразу, не дожидаясь исчерпания попыток.
+
+        Регресс: раньше ветвление шло только по can_retry, и такая задача
+        возвращалась в PENDING с остатком попыток — вечный pending.
+        """
+        async with db.session() as session:
+            svc = TaskService(session)
+            task, _ = await svc.create_task(task_type="ping", payload={}, max_attempts=3)
+            await svc.mark_running(task)
+            await svc.mark_failed(task, "400 Bad Request", retryable=False)
+
+            assert task.status is TaskStatus.DEAD_LETTER
+            assert task.can_retry is True, "попытки остались, но ретраить нельзя"
+            assert task.attempts == 1
+
+    @pytest.mark.asyncio
     async def test_reset_for_retry(self, db: Database) -> None:
         async with db.session() as session:
             svc = TaskService(session)
@@ -116,6 +133,20 @@ class TestRetriesAndDeadLetter:
             assert task.status is TaskStatus.PENDING
             assert task.attempts == 0
             assert task.error is None
+
+    @pytest.mark.asyncio
+    async def test_reset_rejects_succeeded_task(self, db: Database) -> None:
+        """Перезапуск завершённой задачи запрещён — результат уже отдан."""
+        async with db.session() as session:
+            svc = TaskService(session)
+            task, _ = await svc.create_task(task_type="ping", payload={})
+            await svc.mark_running(task)
+            await svc.mark_succeeded(task, result={"ok": True})
+
+            with pytest.raises(ValueError, match="not retryable"):
+                await svc.reset_for_retry(task)
+
+            assert task.status is TaskStatus.SUCCEEDED
 
 
 class TestProcessTask:

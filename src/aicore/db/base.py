@@ -30,7 +30,7 @@ class Base(DeclarativeBase):
 
 def url_is_sqlite(url: str) -> bool:
     """Проверка, что DSN указывает на SQLite (async- или sync-драйвер)."""
-    return url.startswith(("sqlite", "sqlite+aiosqlite"))
+    return url.startswith("sqlite")
 
 
 class UUIDPrimaryKeyMixin:

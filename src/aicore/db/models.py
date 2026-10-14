@@ -14,15 +14,16 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
-    Enum as SAEnum,
-)
-from sqlalchemy import (
+    DateTime,
     ForeignKey,
     Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+)
+from sqlalchemy import (
+    Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -78,7 +79,8 @@ class TaskRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         SAEnum(TaskStatus, name="task_status", values_callable=lambda e: [m.value for m in e]),
         default=TaskStatus.PENDING,
         nullable=False,
-        index=True,
+        # Одиночный index=True здесь убран: композитный
+        # ix_task_runs_status_created_at покрывает status как левый префикс.
     )
 
     # Входные параметры задачи. JSONB на Postgres, обычный JSON на SQLite.
@@ -107,9 +109,12 @@ class TaskRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     cost_usd: Mapped[float | None] = mapped_column(nullable=True)
 
     # Время постановки/старта/завершения — для метрик латентности.
-    queued_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # timezone=True обязателен: utcnow() возвращает aware-datetime, и на
+    # Postgres колонка без TZ (TIMESTAMP WITHOUT TIME ZONE) такой объект
+    # отвергает/теряет смещение. На SQLite расхождение маскируется.
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Ключ идемпотентности для быстрого поиска/отладки. НЕ уникален глобально:
     # уникальность живёт в `idempotency_keys` по паре (key, scope), поэтому
@@ -172,7 +177,7 @@ class Document(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     content_length: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    indexed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def __repr__(self) -> str:
         return f"<Document id={self.id} status={self.status} chunks={self.chunk_count}>"

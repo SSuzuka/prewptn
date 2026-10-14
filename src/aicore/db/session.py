@@ -56,7 +56,7 @@ class Database:
     def _build_engine(self) -> AsyncEngine:
         """Создать движок с параметрами под конкретный диалект."""
         url = self.settings.db_url
-        kwargs: dict[str, Any] = {"echo": self.settings.db_echo, "future": True}
+        kwargs: dict[str, Any] = {"echo": self.settings.db_echo}
 
         if url.startswith("sqlite"):
             # aiosqlite работает в отдельном потоке на соединение; без NullPool

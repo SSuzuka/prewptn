@@ -44,7 +44,7 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 101 тест
+uv run pytest                        # 110 тестов
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
 uv run python scripts/demo.py            # конфиг, логи, health-check
@@ -344,6 +344,23 @@ use_jitter=True, use_delay_exponent=True, max_delay_exponent=60)`. Jitter
 **Таймаут задачи.** `asyncio.timeout(task_timeout_seconds)` оборачивает всю
 обработку, включая задержки. Иначе одно зависшее задание утащило бы воркер в
 бесконечное ожидание. По истечении задача помечается failed с `TimeoutError`.
+
+**`retryable` отдельно от «остались попытки».** `mark_failed(..., retryable=False)`
+отправляет постоянную ошибку (например, 4xx от LLM) сразу в `DEAD_LETTER`, даже
+если попытки остались. Без этого флага постоянная ошибка на первой попытке
+вернула бы задачу в `PENDING` навсегда.
+
+**Все DateTime-колонки timezone-aware.** `utcnow()` возвращает aware-datetime,
+поэтому каждая колонка объявлена `DateTime(timezone=True)`. На Postgres колонка
+без TZ (`TIMESTAMP WITHOUT TIME ZONE`) такой объект испортит, а на SQLite
+расхождение маскируется — поэтому есть регресс-тест на метаданные.
+
+**Ограничение dev-режима ретраев.** `SmartRetryMiddleware` переставляет задачу
+через schedule_source с меткой `delay`, но `InMemoryBroker` не умеет отложенную
+доставку и игнорирует её. Поэтому в dev-режиме backoff/jitter фактически no-op;
+настоящий отложенный ретрай работает на `RedisStreamBroker` + `RedisScheduleSource`.
+Источник правды о лимите попыток — БД (`TaskRun.max_attempts`), middleware-счётчик
+служит предохранителем на стороне брокера.
 
 **Langfuse 4.x на OpenTelemetry, а не 5.x.** API `get_client()` +
 `start_as_current_observation(as_type="generation")` присутствует уже в 4.x и

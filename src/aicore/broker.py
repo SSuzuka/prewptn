@@ -10,11 +10,19 @@
 
 Ретраи настраиваются через SmartRetryMiddleware: exponential backoff + jitter,
 чтобы синхронные ретраи не били пиками по провайдеру.
+
+ВАЖНО про отложенные ретраи (backoff): SmartRetryMiddleware переставляет задачу
+через schedule_source с меткой `delay`. InMemoryBroker не умеет отложенную
+доставку и игнорирует её, поэтому в dev-режиме backoff/jitter фактически
+no-op, а ретрай происходит только когда taskiq повторно исполняет задачу
+сразу (или когда её переставили вручную). Настоящий backoff работает на
+RedisStreamBroker + RedisScheduleSource. Это задокументированное ограничение
+dev-режима, а не баг.
 """
 
 from __future__ import annotations
 
-from taskiq import InMemoryBroker
+from taskiq import AsyncBroker, InMemoryBroker
 from taskiq.middlewares import SmartRetryMiddleware
 
 from aicore.config import Settings, get_settings
@@ -28,6 +36,13 @@ def build_retry_middleware(settings: Settings | None = None) -> SmartRetryMiddle
 
     Сигнатура сверена с taskiq 0.13.0 (`default_retry_count`, `default_delay`,
     `use_jitter`, `use_delay_exponent`, `max_delay_exponent`).
+
+    Примечание: `default_retry_count` — это число ПОВТОРОВ (taskiq semantics):
+    задача исполнится не более `default_retry_count + 1` раз. В БД при этом
+    свой счётчик `TaskRun.attempts/max_attempts`. Источник правды о лимите —
+    БД (`max_attempts`); middleware-счётчик служит предохранителем на стороне
+    брокера. Оба выставляются из одного поля `task_max_retries`, чтобы не
+    расходиться, но семантика у них разная — см. тест test_retry_semantics.
     """
     cfg = settings or get_settings()
     return SmartRetryMiddleware(
@@ -39,7 +54,7 @@ def build_retry_middleware(settings: Settings | None = None) -> SmartRetryMiddle
     )
 
 
-def build_broker(settings: Settings | None = None) -> InMemoryBroker:
+def build_broker(settings: Settings | None = None) -> AsyncBroker:
     """Собрать брокер согласно настройкам.
 
     Для `memory` возвращается InMemoryBroker с await_inplace=True, чтобы в
@@ -48,13 +63,17 @@ def build_broker(settings: Settings | None = None) -> InMemoryBroker:
 
     Для `redis` требуется extra `redis`; импорт делается лениво, чтобы базовый
     `uv sync` оставался лёгким и проект работал без Redis.
+
+    Возвращаемый тип — AsyncBroker: в ветке redis это RedisStreamBroker,
+    в ветке memory — InMemoryBroker. Аннотация была бы неверной как
+    InMemoryBroker для обоих случаев.
     """
     cfg = settings or get_settings()
 
     if cfg.broker_backend == "redis":
         from taskiq_redis import RedisAsyncResultBackend, RedisStreamBroker
 
-        broker: InMemoryBroker = RedisStreamBroker(
+        broker: AsyncBroker = RedisStreamBroker(
             url=cfg.redis_url,
             queue_name=cfg.taskiq_queue,
         ).with_result_backend(
