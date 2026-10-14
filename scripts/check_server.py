@@ -1,5 +1,9 @@
 """Проверка живого HTTP-сервера: поднимает uvicorn и бьёт по эндпоинтам.
 
+Запросы идут через opener с пустым ProxyHandler({}), чтобы системные
+HTTP_PROXY/HTTPS_PROXY не уводили запросы к 127.0.0.1 в прокси
+(иначе на машинах с локальным прокси все роуты отвечают 503).
+
 Запуск:
     uv run python scripts/check_server.py
 """
@@ -19,6 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 ok = True
 
+# Пустой ProxyHandler отключает использование proxy-переменных окружения.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def check(label: str, condition: bool, detail: str = "") -> None:
     global ok
@@ -29,7 +36,7 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 def fetch(path: str) -> tuple[int, str]:
     try:
-        with urllib.request.urlopen(BASE + path, timeout=5) as resp:
+        with OPENER.open(BASE + path, timeout=5) as resp:
             return resp.status, resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:  # 404 и т.п. — тоже валидный ответ сервера
         return exc.code, exc.read().decode("utf-8")

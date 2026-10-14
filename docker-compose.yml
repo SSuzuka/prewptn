@@ -1,0 +1,96 @@
+# ============================================================================
+# Production-инфраструктура для aicore.
+#
+# ВНИМАНИЕ: этот файл в текущем (MVP) состоянии НЕ запускается и НЕ отлажен.
+# По умолчанию проект работает полностью in-memory:
+#     broker_backend=memory, sqlite, qdrant :memory:, llm=stub
+#
+# Чтобы перевести сервис в прод-режим, нужны:
+#   docker compose up -d postgres redis qdrant
+#   BROKER_BACKEND=redis  DB_URL=postgresql+asyncpg://...  VECTOR_BACKEND=qdrant
+#   uv sync --extra redis --extra postgres
+#
+# Сервисы langfuse / prometheus / otel-collector закомментированы — они нужны
+# только для полного observability-стека и относятся к фазе 2.
+# ============================================================================
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aicore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-env}
+      POSTGRES_DB: aicore
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aicore -d aicore"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    # appendonly — иначе при рестарте теряются незавершённые задачи из Streams.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Фаза 2: наблюдаемость. Раскомментировать вместе с настройками в .env.
+  #
+  # langfuse:
+  #   image: langfuse/langfuse:latest
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     DATABASE_URL: postgresql://aicore:${POSTGRES_PASSWORD:-change-me}@postgres:5432/langfuse
+  #     NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-change-me}
+  #     SALT: ${LANGFUSE_SALT:-change-me}
+  #     TELEMETRY_ENABLED: "false"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #
+  # otel-collector:
+  #   image: otel/opentelemetry-collector-contrib:latest
+  #   ports:
+  #     - "4317:4317"
+  #     - "4318:4318"
+  #   volumes:
+  #     - ./deploy/otel-collector.yml:/etc/otel/config.yml:ro
+  # ---------------------------------------------------------------------------
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:

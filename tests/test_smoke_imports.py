@@ -81,9 +81,9 @@ def test_versions_match_intended_api_lines(dist: str, min_version: str) -> None:
 @pytest.mark.parametrize(
     ("dist", "max_version"),
     [
-        ("fastapi", "0.143"),   # 0.143.0: OTel-экспортёры стали opt-in
-        ("langfuse", "5"),      # 5.x: новый API, нужен сервер v4.59+
-        ("mcp", "2"),           # 2.x: удалён mcp.server.fastmcp
+        ("fastapi", "0.143"),  # 0.143.0: OTel-экспортёры стали opt-in
+        ("langfuse", "5"),  # 5.x: новый API, нужен сервер v4.59+
+        ("mcp", "2"),  # 2.x: удалён mcp.server.fastmcp
         ("sqlalchemy", "2.1"),  # 2.1.x: слишком свежая async-линия
     ],
 )

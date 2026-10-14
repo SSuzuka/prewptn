@@ -32,7 +32,9 @@ uv run ruff check src tests
 uv run ruff format --check src tests
 
 # --- запуск ----------------------------------------------------------------
-uv run python scripts/demo.py                  # e2e без инфраструктуры
+uv run python scripts/demo.py                  # демо: конфиг, логи, health-check
+uv run python scripts/check_stage1.py          # проверка config + logging
+uv run python scripts/check_server.py          # поднимает uvicorn и бьёт по API
 uv run uvicorn aicore.api.app:app --reload     # API на 127.0.0.1:8000
 uv run taskiq worker aicore.broker:broker      # воркер (прод-режим)
 

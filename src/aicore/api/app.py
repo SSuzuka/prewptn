@@ -41,8 +41,7 @@ def create_app() -> FastAPI:
         title="AI Agent Platform",
         version="0.1.0",
         description=(
-            "Async task pipeline over LangGraph agents "
-            "with RAG, MCP tools and observability."
+            "Async task pipeline over LangGraph agents with RAG, MCP tools and observability."
         ),
         lifespan=lifespan,
     )

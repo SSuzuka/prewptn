@@ -39,7 +39,27 @@ uv run python scripts/check_server.py    # поднимает uvicorn и бьё�
 uv run uvicorn aicore.api.app:app --reload
 ```
 
-Swagger UI: <http://127.0.0.1:8000/docs> · OpenAPI-схема: `/openapi.json`
+## Проверки
+
+Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
+
+```bash
+uv run pytest                        # 68 тестов
+uv run ruff check src tests scripts  # линтер
+uv run ruff format --check src tests scripts
+uv run python scripts/demo.py        # конфиг, логи, health-check
+uv run python scripts/check_stage1.py
+uv run python scripts/check_server.py
+```
+
+> **Про `ruff`:** он объявлен в `[dependency-groups] dev`, поэтому нужен
+> `uv sync --group dev` (или `uv run ruff ...`, который подтянет группу сам).
+>
+> **Про локальный прокси:** `check_server.py` намеренно использует opener с
+> пустым `ProxyHandler({})`. Иначе системные `HTTP_PROXY`/`HTTPS_PROXY` уводят
+> запросы к `127.0.0.1` в прокси, и все роуты отвечают 503 при открытом порте.
+
+Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> · OpenAPI-схема: `/openapi.json`
 
 ### Требования к окружению
 
@@ -122,29 +142,48 @@ Swagger UI: <http://127.0.0.1:8000/docs> · OpenAPI-схема: `/openapi.json`
 
 ## API
 
-| Метод | Путь | Назначение |
-|---|---|---|
-| `GET` | `/health` | liveness |
-| `GET` | `/metrics` | Prometheus-метрики (latency, счётчики, стоимость) |
-| `POST` | `/v1/documents` | загрузка документа → задача индексации в RAG |
-| `GET` | `/v1/documents/{id}` | статус индексации документа |
-| `POST` | `/v1/tasks` | постановка AI-задачи (идемпотентно, `Idempotency-Key`) |
-| `GET` | `/v1/tasks/{id}` | статус: `pending` / `running` / `succeeded` / `failed` / `dead_letter` |
-| `GET` | `/v1/tasks/{id}/stream` | **SSE**-поток событий выполнения агента |
-| `POST` | `/v1/tasks/{id}/retry` | ручной перезапуск упавшей задачи |
-| `/mcp` | — | Streamable HTTP эндпоинт MCP-сервера |
+Легенда: ✅ реализовано · 📋 запланировано.
 
-Пример:
+**Доступно сейчас:**
+
+| Метод | Путь | Назначение | Статус |
+|---|---|---|---|
+| `GET` | `/health` | liveness + снимок активных бэкендов | ✅ |
+| `GET` | `/ready` | readiness (проверки БД/очереди появятся вместе с ними) | ✅ |
+| `GET` | `/version` | версия сервиса | ✅ |
+| `GET` | `/openapi.json` | OpenAPI-схема | ✅ |
+| `GET` | `/docs` | Swagger UI | ✅ |
+
+**Целевой API (этапы 2–7):**
+
+| Метод | Путь | Назначение | Статус |
+|---|---|---|---|
+| `GET` | `/metrics` | Prometheus-метрики (latency, счётчики, стоимость) | 📋 этап 7 |
+| `POST` | `/v1/documents` | загрузка документа → задача индексации в RAG | 📋 этап 4 |
+| `GET` | `/v1/documents/{id}` | статус индексации документа | 📋 этап 4 |
+| `POST` | `/v1/tasks` | постановка AI-задачи (идемпотентно, `Idempotency-Key`) | 📋 этап 7 |
+| `GET` | `/v1/tasks/{id}` | статус: `pending` / `running` / `succeeded` / `failed` / `dead_letter` | 📋 этап 7 |
+| `GET` | `/v1/tasks/{id}/stream` | **SSE**-поток событий выполнения агента | 📋 этап 7 |
+| `POST` | `/v1/tasks/{id}/retry` | ручной перезапуск упавшей задачи | 📋 этап 7 |
+| `/mcp` | — | Streamable HTTP эндпоинт MCP-сервера | 📋 этап 6 |
+
+Проверить то, что уже есть:
 
 ```bash
-# Поставить задачу и получить id
-curl -sS -X POST http://127.0.0.1:8000/v1/tasks \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: demo-001' \
-  -d '{"question": "Какие есть ограничения по скорости?"}'
+# Поднять сервер
+uv run uvicorn aicore.api.app:app --reload
 
-# Смотреть ход выполнения в реальном времени
-curl -N http://127.0.0.1:8000/v1/tasks/<id>/stream
+# Доступные сейчас эндпоинты
+curl -sS http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/ready
+curl -sS http://127.0.0.1:8000/version
+
+# Пример целевого API (станет рабочим на этапе 7)
+#   curl -sS -X POST http://127.0.0.1:8000/v1/tasks \
+#     -H 'Content-Type: application/json' \
+#     -H 'Idempotency-Key: demo-001' \
+#     -d '{"question": "..."}'
+#   curl -N http://127.0.0.1:8000/v1/tasks/<id>/stream
 ```
 
 ---
@@ -153,24 +192,62 @@ curl -N http://127.0.0.1:8000/v1/tasks/<id>/stream
 
 Всё управляется переменными окружения (`.env`, образец — `.env.example`).
 Значения по умолчанию полностью in-memory, поэтому `scripts/demo.py` и тесты
-работают сразу «из коробки».
+работают сразу «из коробки». Полный список полей — в
+[`.env.example`](.env.example); ниже ключевые.
 
 ```python
+# --- бэкенды (переключатели среды) ---
 broker_backend:  Literal["memory", "redis"]  = "memory"
 db_url:          str = "sqlite+aiosqlite:///./local.db"
 vector_backend:  Literal["memory", "qdrant"] = "memory"
 llm_backend:     Literal["stub", "openai"]   = "stub"
+db_echo:         bool = False          # SQL-лог (шумно, только для отладки)
 
-task_max_retries:        int   = 3
-task_retry_delay_seconds: float = 5.0
-task_retry_use_jitter:   bool  = True
-task_timeout_seconds:    float = 120.0
-llm_timeout_seconds:     float = 60.0
-llm_max_concurrency:     int   = 8
+# --- очередь и ретраи ---
+task_max_retries:             int   = 3
+task_retry_delay_seconds:     float = 5.0
+task_retry_use_jitter:        bool  = True
+task_retry_use_exponent:      bool  = True    # экспоненциальный backoff
+task_retry_max_exponent_delay: float = 60.0   # потолок задержки
+task_timeout_seconds:         float = 120.0
+
+# --- LLM ---
+llm_model:            str   = "gpt-4o-mini"
+llm_timeout_seconds:  float = 60.0
+llm_max_concurrency:  int   = 8      # семафор на одновременные вызовы
+llm_max_retries:      int   = 3
+llm_retry_base_delay: float = 1.0
+llm_price_prompt_per_1k:     float = 0.00015   # USD, для метрик стоимости
+llm_price_completion_per_1k: float = 0.0006
+
+# --- API ---
+api_host:  str = "127.0.0.1"
+api_port:  int = 8000
 api_rate_limit_per_minute: int = 60
+cors_origins: list[str] = ["http://localhost:3000"]   # или строка через запятую
 
-langfuse_public_key: str | None = None   # нет ключа -> SDK работает как no-op
+# --- секреты (только из окружения, в коде не хардкодятся) ---
+openai_api_key:       str | None = None
+langfuse_public_key:  str | None = None   # нет ключа -> SDK работает как no-op
+langfuse_secret_key:  str | None = None
 ```
+
+Остальные поля (адреса инфраструктуры и observability) — по умолчанию
+работоспособны, менять нужно только при переходе в прод-режим:
+
+| Поле | Default | Когда менять |
+|---|---|---|
+| `redis_url` | `redis://localhost:6379/0` | `broker_backend=redis` |
+| `taskiq_queue` | `aicore:tasks` | роутинг задач по очередям |
+| `qdrant_url` | `http://localhost:6333` | `vector_backend=qdrant` |
+| `qdrant_collection` | `aicore_documents` | имя коллекции векторов |
+| `embedding_dim` | `384` | под конкретную модель эмбеддингов |
+| `openai_base_url` | `https://api.openai.com/v1` | совместимый endpoint / прокси |
+| `log_level` | `INFO` | отладка (`DEBUG`) |
+| `log_json` | `True` | `False` для читаемого вывода в dev |
+| `langfuse_base_url` | `https://cloud.langfuse.com` | self-hosted Langfuse |
+| `otel_service_name` | `aicore` | имя сервиса в трейсах |
+| `otel_exporter_otlp_endpoint` | `None` | пусто = трейсы не экспортируются наружу |
 
 ### Разделение dev и prod — принципиальное
 
@@ -305,40 +382,54 @@ Postgres или LLM-ключа: используется `InMemoryBroker`, `sqli
 
 ## Структура проекта
 
+Легенда: ✅ существует · 📋 целевое дерево.
+
 ```
 uop/
-├── README.md                    # этот файл
-├── pyproject.toml               # зависимости, extras, настройки pytest/ruff
-├── uv.lock                      # фиксация точных версий (создаётся uv sync)
-├── .env.example                 # все переключатели с комментариями
-├── .gitignore
-├── docker-compose.yml           # prod-инфраструктура (фаза 2)
+├── README.md                        ✅ этот файл
+├── pyproject.toml                   ✅ зависимости, extras, настройки pytest/ruff
+├── uv.lock                          ✅ фиксация точных версий
+├── .env.example                     ✅ все переключатели с комментариями
+├── .gitignore                       ✅
+├── docker-compose.yml               ✅ лежит, но в MVP не запускается (см. комментарий в файле)
+├── Makefile.ps1                     ✅ шпаргалка по командам
 ├── scripts/
-│   └── demo.py                  # e2e без инфраструктуры
+│   ├── demo.py                      ✅ демо: конфиг, логи, health-check
+│   ├── check_stage1.py              ✅ проверка config + logging
+│   └── check_server.py              ✅ поднимает uvicorn и бьёт по API
 ├── src/aicore/
-│   ├── config.py                # pydantic-settings, env-переключатели
-│   ├── logging.py               # structlog, JSON, correlation_id
-│   ├── telemetry.py             # OpenTelemetry + langfuse get_client()
-│   ├── broker.py                # InMemory | RedisStream + SmartRetryMiddleware
-│   ├── db/
-│   │   ├── base.py models.py session.py   # TaskRun, Document, IdempotencyKey
-│   ├── tasks/
-│   │   ├── rag_index.py agent_run.py dlq.py
-│   ├── llm/
-│   │   ├── base.py openai_compat.py stub.py   # timeout, retry, rate limit, токены/$
-│   ├── rag/
-│   │   ├── chunking.py embeddings.py store.py retriever.py context.py
-│   ├── agents/
-│   │   ├── state.py graph.py tools.py memory.py   # create_agent + supervisor
-│   ├── mcp/
-│   │   └── server.py            # FastMCP + streamable_http_app
+│   ├── __init__.py                  ✅
+│   ├── config.py                    ✅ pydantic-settings, env-переключатели
+│   ├── logging.py                   ✅ structlog, JSON, correlation_id, redaction
 │   ├── api/
-│   │   ├── app.py deps.py
-│   │   └── routes/{health,documents,agents,tasks,metrics}.py
-│   └── streaming/
-│       └── events.py            # Redis Streams -> SSE
-├── tests/                       # pytest, без внешней инфраструктуры
-└── evals/                       # датасет + раннер качества (фаза 2)
+│   │   ├── app.py                   ✅ фабрика приложения + lifespan
+│   │   ├── __init__.py              ✅
+│   │   └── routes/
+│   │       ├── __init__.py          ✅
+│   │       └── health.py            ✅ /health /ready /version
+│   ├── telemetry.py                 📋 OpenTelemetry + langfuse get_client() — этап 3
+│   ├── broker.py                    📋 InMemory | RedisStream + SmartRetryMiddleware — этап 2
+│   ├── db/                          📋 этап 2
+│   │   ├── base.py models.py session.py     # TaskRun, Document, IdempotencyKey
+│   ├── tasks/                       📋 этап 2
+│   │   ├── rag_index.py agent_run.py dlq.py
+│   ├── llm/                         📋 этап 3
+│   │   ├── base.py openai_compat.py stub.py  # timeout, retry, rate limit, токены/$
+│   ├── rag/                         📋 этап 4
+│   │   ├── chunking.py embeddings.py store.py retriever.py context.py
+│   ├── agents/                      📋 этап 5
+│   │   ├── state.py graph.py tools.py memory.py  # create_agent + supervisor
+│   ├── mcp/                         📋 этап 6
+│   │   └── server.py                     # FastMCP + streamable_http_app
+│   ├── api/routes/                  📋 этапы 4/6/7
+│   │   └── {documents,agents,tasks,metrics}.py
+│   └── streaming/                   📋 этап 7
+│       └── events.py                     # Redis Streams -> SSE
+├── tests/                           ✅ pytest, без внешней инфраструктуры
+│   ├── test_smoke_imports.py        ✅
+│   ├── test_config_logging.py       ✅
+│   └── test_api_health.py           ✅
+└── evals/                           📋 датасет + раннер качества — фаза 2
 ```
 
 ---
