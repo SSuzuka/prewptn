@@ -10,7 +10,7 @@ Backend-сервис, который принимает AI-задачу, про�
 > |---|---|---|
 > | 0 | Каркас репозитория, пины, env-переключатели, README | ✅ |
 > | 1 | `config.py`, `logging.py`, health-check + live-сервер | ✅ |
-> | 2 | БД + брокер: статусы, retries, idempotency, DLQ | 📋 |
+> | 2 | БД + брокер: статусы, retries, idempotency, DLQ | ✅ |
 > | 3 | LLM-слой: timeouts, rate limit, учёт токенов и стоимости | 📋 |
 > | 4 | RAG: chunking → embeddings → Qdrant → контекст | 📋 |
 > | 5 | Агенты: `create_agent` + supervisor-граф на LangGraph | 📋 |
@@ -44,12 +44,13 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 68 тестов
+uv run pytest                        # 95 тестов
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
-uv run python scripts/demo.py        # конфиг, логи, health-check
-uv run python scripts/check_stage1.py
-uv run python scripts/check_server.py
+uv run python scripts/demo.py            # конфиг, логи, health-check
+uv run python scripts/check_stage1.py    # config + logging
+uv run python scripts/check_stage2.py    # БД, брокер, retries, DLQ
+uv run python scripts/check_server.py    # поднимает uvicorn и бьёт по API
 ```
 
 > **Про `ruff`:** он объявлен в `[dependency-groups] dev`, поэтому нужен
@@ -407,12 +408,17 @@ uop/
 │   │   └── routes/
 │   │       ├── __init__.py          ✅
 │   │       └── health.py            ✅ /health /ready /version
+│   ├── broker.py                    ✅ InMemory | RedisStream + SmartRetryMiddleware
+│   ├── db/                          ✅ этап 2
+│   │   ├── __init__.py              ✅
+│   │   ├── base.py                  ✅ Base, naming_convention, url_is_sqlite
+│   │   ├── models.py                ✅ TaskRun, Document, IdempotencyKey
+│   │   └── session.py               ✅ async-движок, сессии, create_all, PRAGMA FK
+│   ├── tasks/                       ✅ этап 2
+│   │   ├── __init__.py              ✅
+│   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ
+│   │   └── ping.py                  ✅ задача-образец с ретраями
 │   ├── telemetry.py                 📋 OpenTelemetry + langfuse get_client() — этап 3
-│   ├── broker.py                    📋 InMemory | RedisStream + SmartRetryMiddleware — этап 2
-│   ├── db/                          📋 этап 2
-│   │   ├── base.py models.py session.py     # TaskRun, Document, IdempotencyKey
-│   ├── tasks/                       📋 этап 2
-│   │   ├── rag_index.py agent_run.py dlq.py
 │   ├── llm/                         📋 этап 3
 │   │   ├── base.py openai_compat.py stub.py  # timeout, retry, rate limit, токены/$
 │   ├── rag/                         📋 этап 4
@@ -426,9 +432,12 @@ uop/
 │   └── streaming/                   📋 этап 7
 │       └── events.py                     # Redis Streams -> SSE
 ├── tests/                           ✅ pytest, без внешней инфраструктуры
+│   ├── conftest.py                  ✅ фикстуры (SQLite :memory: + StaticPool)
 │   ├── test_smoke_imports.py        ✅
 │   ├── test_config_logging.py       ✅
-│   └── test_api_health.py           ✅
+│   ├── test_api_health.py           ✅
+│   ├── test_db_schema.py            ✅
+│   └── test_task_service.py         ✅
 └── evals/                           📋 датасет + раннер качества — фаза 2
 ```
 
