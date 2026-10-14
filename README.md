@@ -11,7 +11,7 @@ Backend-сервис, который принимает AI-задачу, про�
 > | 0 | Каркас репозитория, пины, env-переключатели, README | ✅ |
 > | 1 | `config.py`, `logging.py`, health-check + live-сервер | ✅ |
 > | 2 | БД + брокер: статусы, retries, idempotency, DLQ | ✅ |
-> | 3 | LLM-слой: timeouts, rate limit, учёт токенов и стоимости | 📋 |
+> | 3 | LLM-слой: timeouts, rate limit, учёт токенов и стоимости | ✅ |
 > | 4 | RAG: chunking → embeddings → Qdrant → контекст | 📋 |
 > | 5 | Агенты: `create_agent` + supervisor-граф на LangGraph | 📋 |
 > | 6 | MCP-сервер + монтирование в FastAPI | 📋 |
@@ -44,12 +44,13 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 110 тестов
+uv run pytest                        # 149 тестов
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
 uv run python scripts/demo.py            # конфиг, логи, health-check
 uv run python scripts/check_stage1.py    # config + logging
 uv run python scripts/check_stage2.py    # БД, брокер, retries, DLQ
+uv run python scripts/check_stage3.py    # LLM: timeout, retries, токены, стоимость
 uv run python scripts/check_server.py    # поднимает uvicorn и бьёт по API
 ```
 
@@ -299,6 +300,7 @@ LLM_BACKEND=openai
 ```bash
 uv sync --extra redis      # taskiq-redis, прод-брокер
 uv sync --extra postgres   # asyncpg, прод-БД
+uv sync --extra openai     # httpx, транспорт к OpenAI-совместимому endpoint
 ```
 
 `docker-compose.yml` в MVP намеренно **не запускается** — он лежит как
@@ -334,6 +336,33 @@ use_jitter=True, use_delay_exponent=True, max_delay_exponent=60)`. Jitter
 **Учёт стоимости LLM.** Каждый вызов фиксирует `prompt_tokens`,
 `completion_tokens`, `latency_ms` и `cost_usd` → Prometheus + Langfuse.
 Оптимизация latency и стоимости должна быть измеримой, иначе это не оптимизация.
+
+**Один контракт на все провайдеры.** Весь код зависит от протокола `LLMClient`
+и возвращает `LLMResponse` (текст + токены + latency + `cost_usd`), а не от
+конкретного SDK. `stub` и `openai` взаимозаменяемы через `build_llm_client`,
+поэтому вызовы не ветвятся по бэкенду, а dev/тесты идут на детерминированном
+`StubLLM` без сети и ключей.
+
+**Ретрай только для transient-ошибок.** Ошибки разделены на
+`LLMTransientError` (timeout, connection reset, 429, 5xx) и
+`LLMPermanentError` (4xx: bad request, auth, неизвестная модель). Повторяется
+только первое с exponential backoff + jitter; постоянная ошибка падает сразу.
+Иначе 401 от провайдера бессмысленно долбить ретраями, а 429 — наоборот, нужно.
+
+**Timeout, rate limit и ретраи — в одном месте.** `asyncio.timeout` на попытку,
+`asyncio.Semaphore(llm_max_concurrency)` на одновременные запросы и общий
+retry-цикл живут в клиенте, а не в вызывающем коде: один зависший провайдер не
+утащит пул воркеров, а лимит concurrency не нужно дублировать в каждом агенте.
+
+**Стоимость считается из токенов и цены за 1k.** `compute_cost_usd(usage,
+prompt_per_1k, completion_per_1k)` — единственная точка расчёта `$`, из неё
+метрика уходит в `TaskRun.cost_usd`, логи и Langfuse. Цены — конфиг, а не
+хардкод: смена модели/провайдера не требует правки кода.
+
+**Telemetry no-op safe.** Langfuse-клиент создаётся только когда заданы оба
+ключа (иначе SDK логирует auth-ошибку и сам себя отключает), а OTLP-экспортёр
+подключается лишь при заданном endpoint. `record_generation` глотает и логирует
+ошибку экспортёра — телеметрия не должна ломать сам вызов LLM.
 
 **Идемпотентность изолирована по скоупу.** Источник правды — таблица
 `idempotency_keys` с уникальностью по паре `(key, scope)`, а не глобальная
@@ -400,6 +429,7 @@ Postgres или LLM-ключа: используется `InMemoryBroker`, `sqli
 | БД | SQLAlchemy · aiosqlite · asyncpg *(extra)* | `>=2.0,<2.1` · `>=0.20,<0.23` · `>=0.30,<0.33` |
 | Агенты | langchain · langgraph | `>=1.0,<2` · `>=1.0,<2` |
 | RAG | qdrant-client | `>=1.10,<2` |
+| LLM | httpx *(extra `openai`)* | `>=0.27,<0.29` |
 | Наблюдаемость | langfuse · structlog · prometheus-client · opentelemetry-sdk | `>=4.17,<5` · `>=24,<27` · `>=0.20,<1` · `>=1.27,<2` |
 | Инструменты | mcp | `>=1.28,<2` |
 | Streaming | sse-starlette | `>=3.0,<4` |
@@ -427,6 +457,8 @@ uop/
 ├── scripts/
 │   ├── demo.py                      ✅ демо: конфиг, логи, health-check
 │   ├── check_stage1.py              ✅ проверка config + logging
+│   ├── check_stage2.py              ✅ проверка БД, брокера, retries, DLQ
+│   ├── check_stage3.py              ✅ проверка LLM: timeout, retries, токены, $
 │   └── check_server.py              ✅ поднимает uvicorn и бьёт по API
 ├── src/aicore/
 │   ├── __init__.py                  ✅
@@ -448,9 +480,12 @@ uop/
 │   │   ├── __init__.py              ✅
 │   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ
 │   │   └── ping.py                  ✅ задача-образец с ретраями
-│   ├── telemetry.py                 📋 OpenTelemetry + langfuse get_client() — этап 3
-│   ├── llm/                         📋 этап 3
-│   │   ├── base.py openai_compat.py stub.py  # timeout, retry, rate limit, токены/$
+│   ├── telemetry.py                 ✅ OpenTelemetry + langfuse get_client() — этап 3
+│   ├── llm/                         ✅ этап 3
+│   │   ├── __init__.py              ✅ фабрика build_llm_client + синглтон
+│   │   ├── base.py                  ✅ LLMRequest/Response, ошибки, cost, retry-политика
+│   │   ├── stub.py                  ✅ детерминированный StubLLM (dev/тесты)
+│   │   └── openai_compat.py         ✅ timeout, retry, семафор, токены/$
 │   ├── rag/                         📋 этап 4
 │   │   ├── chunking.py embeddings.py store.py retriever.py context.py
 │   ├── agents/                      📋 этап 5
@@ -469,7 +504,13 @@ uop/
 │   ├── test_db_schema.py            ✅
 │   ├── test_task_service.py         ✅
 │   ├── test_idempotency_scope.py    ✅ изоляция по scope (регресс)
-│   └── test_broker.py               ✅
+│   ├── test_broker.py               ✅
+│   ├── test_llm_base.py             ✅ usage/cost + retry-политика
+│   ├── test_llm_stub.py             ✅ детерминированный клиент
+│   ├── test_llm_openai_compat.py    ✅ timeout/retry/семафор на MockTransport
+│   ├── test_llm_factory.py          ✅ выбор бэкенда + синглтон
+│   ├── test_llm_metrics_e2e.py      ✅ токены/$ сохраняются в TaskRun
+│   └── test_telemetry.py            ✅ no-op-safe OTel + langfuse
 └── evals/                           📋 датасет + раннер качества — фаза 2
 ```
 

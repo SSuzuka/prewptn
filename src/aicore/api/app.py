@@ -14,14 +14,16 @@ from fastapi import FastAPI
 from aicore.api.routes import health
 from aicore.config import get_settings
 from aicore.logging import configure_logging, get_correlation_id, get_logger
+from aicore.telemetry import configure_telemetry
 
 logger = get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Настройка логирования на старте и мягкое завершение на стопе."""
+    """Настройка логирования и телеметрии на старте, мягкое завершение на стопе."""
     configure_logging()
+    configure_telemetry()
     settings = get_settings()
     logger.info(
         "app.startup",

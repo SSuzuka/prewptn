@@ -30,6 +30,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+openai = [
+    { name = "httpx" },
+]
 postgres = [
     { name = "asyncpg" },
 ]
@@ -50,6 +53,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20,<0.23" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30,<0.33" },
     { name = "fastapi", specifier = ">=0.142,<0.143" },
+    { name = "httpx", marker = "extra == 'openai'", specifier = ">=0.27,<0.29" },
     { name = "langchain", specifier = ">=1.0,<2" },
     { name = "langfuse", specifier = ">=4.17,<5" },
     { name = "langgraph", specifier = ">=1.0,<2" },
@@ -66,7 +70,7 @@ requires-dist = [
     { name = "taskiq-redis", marker = "extra == 'redis'", specifier = ">=1.2,<2" },
     { name = "uvicorn", specifier = ">=0.30,<0.55" },
 ]
-provides-extras = ["redis", "postgres"]
+provides-extras = ["redis", "postgres", "openai"]
 
 [package.metadata.requires-dev]
 dev = [

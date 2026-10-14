@@ -39,6 +39,11 @@ redis = [
 postgres = [
     "asyncpg>=0.30,<0.33",
 ]
+# Production-режим LLM: httpx-транспорт к OpenAI-совместимому endpoint.
+# Базовый `uv sync` не тянет его: dev/тесты работают на StubLLM без сети.
+openai = [
+    "httpx>=0.27,<0.29",
+]
 
 [dependency-groups]
 dev = [
