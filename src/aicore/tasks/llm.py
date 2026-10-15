@@ -14,13 +14,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from aicore.broker import broker
+from aicore.broker import broker, ensure_broker_started
 from aicore.config import get_settings
-from aicore.db.models import TaskRun
 from aicore.db.session import get_database
 from aicore.llm import LLMPermanentError, LLMRequest, get_llm_client
 from aicore.logging import get_logger
 from aicore.metrics import record_rag_fallback
+from aicore.tasks._common import load_task, mark_task_failed
 from aicore.tasks.service import TaskService
 
 logger = get_logger(__name__)
@@ -35,7 +35,7 @@ async def answer_question(task_id: str) -> dict[str, Any]:
             return await _run(task_id)
     except TimeoutError:
         logger.error("task.timeout", task_id=task_id, timeout=settings.task_timeout_seconds)
-        await _mark_failed(task_id, "TimeoutError: task exceeded deadline", retryable=True)
+        await mark_task_failed(task_id, "TimeoutError: task exceeded deadline", retryable=True)
         raise
 
 
@@ -46,7 +46,7 @@ async def _run(task_id: str) -> dict[str, Any]:
     # Фаза 1: загрузить задачу и отметить running, затем отпустить соединение.
     async with db.session() as session:
         svc = TaskService(session)
-        task = await _load(svc, task_id)
+        task = await load_task(svc, task_id)
         if task is None:
             return {"status": "failed", "task_id": task_id, "error": "task not found"}
         await svc.mark_running(task)
@@ -66,17 +66,17 @@ async def _run(task_id: str) -> dict[str, Any]:
         response = await client.complete(request)
     except LLMPermanentError as exc:
         error = f"{type(exc).__name__}: {exc}"
-        await _mark_failed(task_id, error, retryable=False)
+        await mark_task_failed(task_id, error, retryable=False)
         return {"status": "dead_letter", "task_id": task_id, "error": error}
     except Exception as exc:  # noqa: BLE001 — transient: пусть брокер ретраит
-        await _mark_failed(task_id, f"{type(exc).__name__}: {exc}", retryable=True)
+        await mark_task_failed(task_id, f"{type(exc).__name__}: {exc}", retryable=True)
         raise
 
     # Фаза 3: сохранить ответ и его метрики.
     result = {"answer": response.text, "model": response.model, "latency_ms": response.latency_ms}
     async with db.session() as session:
         svc = TaskService(session)
-        task = await _load(svc, task_id)
+        task = await load_task(svc, task_id)
         if task is None:
             return {"status": "failed", "task_id": task_id, "error": "task not found"}
         await svc.mark_succeeded(
@@ -112,50 +112,14 @@ async def _with_rag(question: str) -> str:
     return build_rag_prompt(question, bundle)
 
 
-async def _load(svc: TaskService, task_id: str) -> TaskRun | None:
-    """Загрузить задачу; None, если id некорректен или задача не найдена."""
-    try:
-        task = await svc.get_task(task_id)
-    except ValueError:
-        logger.error("task.invalid_id", task_id=task_id)
-        return None
-    if task is None:
-        logger.error("task.not_found", task_id=task_id)
-    return task
-
-
-async def _mark_failed(task_id: str, error: str, *, retryable: bool) -> None:
-    """Отметить неудачу в отдельной сессии (в т.ч. после таймаута)."""
-    db = get_database()
-    try:
-        async with db.session() as session:
-            svc = TaskService(session)
-            task = await _load(svc, task_id)
-            if task is not None:
-                await svc.mark_failed(task, error, retryable=retryable)
-    except Exception:  # noqa: BLE001 — не маскируем исходную ошибку
-        logger.exception("task.mark_failed_failed", task_id=task_id)
-
-
 async def enqueue_answer_question(task_id: str) -> None:
     """Поставить задачу в брокер.
 
     На InMemoryBroker (dev) задача исполняется прямо здесь; на
     RedisStreamBroker (prod) вызов только кладёт её в очередь и возвращается.
     """
-    await _ensure_broker_started()
+    await ensure_broker_started()
     try:
         await answer_question.kiq(task_id)
     except Exception:  # noqa: BLE001 — ошибку уже зафиксировали в БД
         logger.exception("task.enqueue_failed", task_id=task_id)
-
-
-_broker_started = False
-
-
-async def _ensure_broker_started() -> None:
-    """Запустить брокер один раз (в проде воркер делает это сам)."""
-    global _broker_started
-    if not _broker_started:
-        await broker.startup()
-        _broker_started = True

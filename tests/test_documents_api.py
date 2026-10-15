@@ -134,9 +134,7 @@ class TestRetryDispatch:
         # index_document перезапускалась не тем обработчиком.
         content = "retryable indexable content"
         async with db.session() as session:
-            document, _ = await DocumentService(session).create_document(
-                title="t", content=content
-            )
+            document, _ = await DocumentService(session).create_document(title="t", content=content)
             document_id = str(document.id)
 
         task_id = await _failed_task(

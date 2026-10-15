@@ -31,6 +31,21 @@ class DocumentCreateRequest(BaseModel):
     source: str | None = Field(default=None, max_length=1024, description="Источник/URL")
 
 
+class AgentRunRequest(BaseModel):
+    """Тело `POST /v1/agents`."""
+
+    question: str = Field(min_length=1, max_length=8000, description="Запрос к агенту")
+    thread_id: str | None = Field(
+        default=None,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description=(
+            "Id беседы для памяти агента; по умолчанию — id задачи. "
+            "В неаутентифицированном MVP это общий ключ без изоляции по вызывающему."
+        ),
+    )
+
+
 class DocumentView(BaseModel):
     """Публичное представление документа RAG и статуса его индексации."""
 

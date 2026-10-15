@@ -15,18 +15,19 @@ Backend-сервис, который принимает AI-задачу, про�
 > | 2 | БД + брокер: статусы, retries, idempotency, DLQ | ✅ |
 > | 3 | LLM-слой: timeouts, rate limit, учёт токенов и стоимости | ✅ |
 > | 4 | RAG: chunking → embeddings → Qdrant → контекст | ✅ |
-> | 5 | Агенты: `create_agent` + supervisor-граф на LangGraph | 📋 |
+> | 5 | Агенты: `create_agent` + supervisor (subagents-as-tools) | ✅ |
 > | 6 | MCP-сервер + монтирование в FastAPI | 📋 |
 > | 7 | API + SSE-стриминг + `/metrics` | 🚧 срез |
-> | 9 | `evals/`: faithfulness / relevance / стоимость | 📋 фаза 2 |
+> | 9 | `evals/`: trajectory + outcome (детерминированные грейдеры) | 🚧 срез |
 >
 > Тесты защищают от молчаливого ухода на breaking-линии: если uv подтянет
 > `fastapi 0.143+`, `langfuse 5+`, `mcp 2+` или `sqlalchemy 2.1+`, они упадут
 > (см. `tests/test_smoke_imports.py`).
 >
 > Реализован сквозной срез: `/v1/tasks` (создание/статус/retry), SSE-стриминг,
-> `/metrics` и RAG (`/v1/documents`: индексация + retrieval) — офлайн, на
-> StubLLM и детерминированном stub-эмбеддере. Агенты (5) и MCP (6) отложены.
+> `/metrics`, RAG (`/v1/documents`) и агенты (`/v1/agents`: supervisor +
+> subagents, RAG как tool) — офлайн, на детерминированной stub-модели и
+> stub-эмбеддере. MCP (6) отложен.
 
 ---
 
@@ -50,7 +51,7 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 220 тестов
+uv run pytest                        # 251 тест
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
 uv run python scripts/demo.py            # конфиг, логи, health-check
@@ -58,6 +59,7 @@ uv run python scripts/check_stage1.py    # config + logging
 uv run python scripts/check_stage2.py    # БД, брокер, retries, DLQ
 uv run python scripts/check_stage3.py    # LLM: timeout, retries, токены, стоимость
 uv run python scripts/check_stage4.py    # RAG: chunking, embeddings, Qdrant, retrieval
+uv run python scripts/check_stage5.py    # агенты: supervisor + subagents, tools, evals
 uv run python scripts/check_server.py    # uvicorn + сквозной путь задачи (POST/SSE/metrics)
 ```
 
@@ -110,17 +112,19 @@ Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> 
         └───────────────┬──────────────────────────┘
                         ▼
         ┌──────────────────────────────────────────┐
-        │   LangGraph supervisor  (agents/)        │
-        │   ┌────────────┐      ┌────────────┐     │
-        │   │ RAG-агент  │      │ Tool-агент │     │
-        │   └─────┬──────┘      └──────┬─────┘     │
-        └─────────┼────────────────────┼───────────┘
-                  │                    │
-        ┌─────────▼────────┐  ┌────────▼─────────┐
-        │   RAG  (rag/)    │  │  MCP  (mcp/)     │
-        │ embeddings       │  │ инструменты и    │
-        │ Qdrant :memory:  │  │ внешние системы  │
-        └──────────────────┘  └──────────────────┘
+        │   create_agent supervisor  (agents/)     │
+        │   └─ research_knowledge_base (subagent)  │
+        └───────────────┬──────────────────────────┘
+                        │ tool call
+        ┌───────────────▼──────────────────────────┐
+        │   knowledge subagent                     │
+        │   └─ search_knowledge_base (RAG tool)    │
+        └───────────────┬──────────────────────────┘
+                        │
+        ┌───────────────▼─────────┐   ┌──────────────┐
+        │   RAG  (rag/)           │   │ MCP  (mcp/)  │
+        │ embeddings · Qdrant     │   │  📋 этап 6   │
+        └─────────────────────────┘   └──────────────┘
                   │
                   ▼
         ┌──────────────────────────────────────────┐
@@ -137,7 +141,7 @@ Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> 
                                                       Langfuse (OTel)
 ```
 
-**Поток одной задачи, пошагово** (реализованный срез, без RAG и агентов):
+**Поток одной задачи, пошагово** (реализованный срез):
 
 1. `POST /v1/tasks` с заголовком `Idempotency-Key` — повторный запрос с тем же
    ключом вернёт **существующую** задачу, а не создаст дубль и не сожжёт токены.
@@ -152,9 +156,14 @@ Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> 
 RAG (этап 4) реализован как отдельная подсистема: документы индексируются через
 `/v1/documents`, а ответ можно «заземлить» контекстом, поставив `use_rag=true`
 (тогда перед вызовом LLM подмешиваются retrieved-чанки; retrieval-ошибка
-деградирует до ответа без контекста, не роняя задачу). LangGraph-supervisor с
-подагентами (этап 5) в этот срез не входит — сейчас шаг 4 это прямой вызов LLM,
-а не агентский граф.
+деградирует до ответа без контекста, не роняя задачу).
+
+Агенты (этап 5) идут отдельным маршрутом `/v1/agents`: задача типа `run_agent`
+прогоняет граф `create_agent` — supervisor делегирует вопрос knowledge-подагенту
+через tool `research_knowledge_base`, а тот вызывает `search_knowledge_base`
+(тот же гибридный retrieval из RAG). Токены/стоимость суммируются по всем шагам
+модели в `TaskRun`, поэтому `/metrics` и API показывают реальную цену прогона.
+Прямой LLM-путь `/v1/tasks` (`use_rag`) остаётся без агентского графа.
 
 ---
 
@@ -179,8 +188,9 @@ RAG (этап 4) реализован как отдельная подсисте
 | `POST` | `/v1/documents` | загрузка документа → задача индексации в RAG (идемпотентно по содержимому) | ✅ |
 | `GET` | `/v1/documents` | список документов RAG | ✅ |
 | `GET` | `/v1/documents/{id}` | статус индексации документа | ✅ |
+| `POST` | `/v1/agents` | запуск агента (supervisor + subagents, RAG как tool), идемпотентно | ✅ |
 
-**Целевой API (этапы 5–6):**
+**Целевой API (этап 6):**
 
 | Метод | Путь | Назначение | Статус |
 |---|---|---|---|
@@ -222,6 +232,15 @@ curl -sS -X POST http://127.0.0.1:8000/v1/tasks \
   -d '{"question": "how to avoid duplicate spend?", "use_rag": true}'
 ```
 
+Сквозной агентный сценарий (supervisor + subagents):
+
+```bash
+# Запустить агента; статус/SSE/метрики — через общий /v1/tasks/{id}
+curl -sS -X POST http://127.0.0.1:8000/v1/agents \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "how does the broker handle redelivery?"}'
+```
+
 ---
 
 ## Конфигурация
@@ -238,6 +257,7 @@ db_url:          str = "sqlite+aiosqlite:///./local.db"
 vector_backend:  Literal["memory", "qdrant"] = "memory"
 llm_backend:     Literal["stub", "openai"]   = "stub"
 embedding_backend: Literal["stub", "local", "openai"] = "stub"
+agent_backend:   Literal["stub", "openai"]   = "stub"   # LangChain-модель для агентов
 db_echo:         bool = False          # SQL-лог (шумно, только для отладки)
 
 # --- очередь и ретраи ---
@@ -268,6 +288,15 @@ rag_retrieve_limit:    int   = 5        # топ-k чанков в контек�
 rag_retrieve_fetch_k:  int   = 20       # пул кандидатов до ранжирования
 rag_hybrid_enabled:    bool  = True     # плотный поиск + лексический ранк (RRF)
 rag_context_max_chars: int   = 6000     # бюджет контекста в промпте
+
+# --- агенты (create_agent: supervisor + subagents) ---
+agent_model:          str   = "gpt-4o-mini"
+agent_temperature:    float = 0.0
+agent_max_model_calls: int  = 10        # guardrail: лимит вызовов модели за прогон
+agent_max_tool_calls:  int  = 15        # guardrail: лимит вызовов инструментов
+agent_recursion_limit: int  = 25        # лимит шагов графа
+agent_summarize_trigger_tokens: int = 0 # >0 — сжимать историю (SummarizationMiddleware)
+agent_max_threads:    int   = 256       # предел веток (thread_id) в in-memory чекпойнтере
 
 # --- API ---
 api_host:  str = "127.0.0.1"
@@ -310,6 +339,7 @@ langfuse_secret_key:  str | None = None
 | БД | `sqlite+aiosqlite` | **только** PostgreSQL + `asyncpg` |
 | Векторный поиск | `AsyncQdrantClient(":memory:")` | Qdrant-сервер |
 | LLM | `StubLLM` (детерминированный, без ключей) | OpenAI-совместимый endpoint |
+| Агенты | `StubChatModel` (детерминированный, tool calling) | `ChatOpenAI` (extra `openai`) |
 | Эмбеддинги | `StubEmbeddings` (хэш, без сети и ключей) | `local` (fastembed, бесплатно) или OpenAI-совместимый `/embeddings` |
 
 **Почему `InMemoryBroker` нельзя брать в прод.** Он исполняет задачи в текущем
@@ -338,6 +368,7 @@ BROKER_BACKEND=redis
 DB_URL=postgresql+asyncpg://user:pass@localhost:5432/aicore
 VECTOR_BACKEND=qdrant
 LLM_BACKEND=openai
+AGENT_BACKEND=openai      # ChatOpenAI для агентов (тот же endpoint)
 EMBEDDING_BACKEND=local   # бесплатные локальные эмбеддинги (fastembed), либо openai
 ```
 
@@ -350,7 +381,7 @@ EMBEDDING_BACKEND=local   # бесплатные локальные эмбедд
 ```bash
 uv sync --extra redis      # taskiq-redis, прод-брокер
 uv sync --extra postgres   # asyncpg, прод-БД
-uv sync --extra openai     # httpx, транспорт к OpenAI-совместимому endpoint
+uv sync --extra openai     # httpx + langchain-openai: LLM-транспорт и ChatOpenAI для агентов
 uv sync --extra embeddings # fastembed (ONNX): бесплатные локальные эмбеддинги
 ```
 
@@ -539,6 +570,38 @@ fusion: не нужна калибровка скоров, работает де
 параметр задания индексации. Идемпотентность загрузки — по `content_hash`
 (уникален), поэтому повторная загрузка того же текста не жжёт эмбеддинги.
 
+**Агенты — subagents-as-tools, а не `create_supervisor`.** С октября 2025
+`langgraph-supervisor`/`create_supervisor` больше не поддерживается; официальный
+паттерн в LangChain 1.x — supervisor на `create_agent`, который вызывает
+подагента обычным tool'ом. Так и сделано: `research_knowledge_base` — обёртка над
+отдельным `create_agent`-графом knowledge-агента, а RAG доступен ему через
+`search_knowledge_base`. Лишний multi-agent там, где хватает одного агента, не
+строится: supervisor делегирует только retrieval-вопросы.
+
+**Guardrails — middleware, а не форк цикла.** `ModelCallLimitMiddleware` и
+`ToolCallLimitMiddleware` (плюс `agent_recursion_limit`) ограничивают прогон.
+Учёт токенов/стоимости — не middleware, а `AgentUsageCallbackHandler`, который
+прокидывается в `callbacks` вызова: он видит и шаги супервизора, и вложенный
+прогон подагента (тот же `usage_metadata`), и пишет те же Prometheus-метрики,
+что и прямой LLM-вызов. Собственный цикл агента не нужен.
+
+**Память агента ограничена.** Общий чекпойнтер — `BoundedInMemorySaver`
+(`agent_max_threads`): старейшие ветки `thread_id` вытесняются, чтобы клиентский
+id не раздувал память воркера. Подагент своего чекпойнтера не держит (он
+одноразовый), поэтому не копит ветки на каждый вызов. Изоляция бесед по
+вызывающему — задача аутентификации (фаза 2); в MVP `thread_id` — общий
+клиентский ключ.
+
+**Детерминированная LangChain-модель для оффлайна.** `create_agent` требует
+LangChain `BaseChatModel`; чтобы граф (модель → tools → модель) гонялся в CI и
+локально без сети и ключей, есть `StubChatModel` с настоящим tool calling.
+Инструменты читаются из kwargs вызова (`bind(tools=...)`), поэтому один инстанс
+безопасно делят supervisor и подагент.
+
+**Асинхронные инструменты.** Граф исполняется через `ainvoke` (воркер и так
+асинхронный), а sync-путь LangGraph падает на асинхронных `StructuredTool`.
+Поэтому все tools объявлены `async`.
+
 ---
 
 ## Технологический стек
@@ -553,6 +616,7 @@ fusion: не нужна калибровка скоров, работает де
 | Очередь | taskiq · taskiq-redis *(extra)* | `>=0.13,<0.14` · `>=1.2,<2` |
 | БД | SQLAlchemy · aiosqlite · asyncpg *(extra)* | `>=2.0,<2.1` · `>=0.20,<0.23` · `>=0.30,<0.33` |
 | Агенты | langchain · langgraph | `>=1.0,<2` · `>=1.0,<2` |
+| Агенты (prod) | langchain-openai *(extra `openai`)* | `>=1.0,<2` |
 | RAG | qdrant-client | `>=1.10,<2` |
 | RAG эмбеддинги | fastembed *(extra)* | `>=0.4,<1` |
 | LLM | httpx *(extra `openai`)* | `>=0.27,<0.29` |
@@ -589,6 +653,7 @@ uop/
 │   ├── check_stage2.py              ✅ проверка БД, брокера, retries, DLQ
 │   ├── check_stage3.py              ✅ проверка LLM: timeout, retries, токены, $
 │   ├── check_stage4.py              ✅ проверка RAG: chunking, embeddings, Qdrant, retrieval
+│   ├── check_stage5.py              ✅ проверка агентов: supervisor + subagents, evals
 │   └── check_server.py              ✅ поднимает uvicorn и бьёт по API
 ├── src/aicore/
 │   ├── __init__.py                  ✅
@@ -604,6 +669,7 @@ uop/
 │   │       ├── health.py            ✅ /health /ready /version
 │   │       ├── tasks.py             ✅ /v1/tasks (+retry, SSE)
 │   │       ├── documents.py         ✅ /v1/documents (загрузка/статус/список)
+│   │       ├── agents.py            ✅ /v1/agents (запуск агента)
 │   │       └── metrics.py           ✅ /metrics
 │   ├── broker.py                    ✅ InMemory | RedisStream + SmartRetryMiddleware
 │   ├── db/                          ✅ этап 2
@@ -616,7 +682,8 @@ uop/
 │   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ
 │   │   ├── ping.py                  ✅ задача-образец с ретраями
 │   │   ├── llm.py                   ✅ answer_question: LLM + метрики в TaskRun
-│   │   └── rag_index.py             ✅ index_document: chunking → embed → Qdrant
+│   │   ├── rag_index.py             ✅ index_document: chunking → embed → Qdrant
+│   │   └── agent_run.py             ✅ run_agent: граф агента + суммарные метрики
 │   ├── telemetry.py                 ✅ OpenTelemetry + langfuse get_client() — этап 3
 │   ├── metrics.py                   ✅ Prometheus: счётчики/гистограммы задач и LLM
 │   ├── llm/                         ✅ этап 3
@@ -634,8 +701,17 @@ uop/
 │   │   ├── retriever.py             ✅ index + гибридный поиск (RRF)
 │   │   ├── context.py               ✅ сборка контекста с бюджетом и цитатами
 │   │   └── documents.py             ✅ DocumentService: статусы, content_hash
-│   ├── agents/                      📋 этап 5
-│   │   ├── state.py graph.py tools.py memory.py  # create_agent + supervisor
+│   ├── agents/                      ✅ этап 5
+│   │   ├── __init__.py              ✅ фабрика build_agent + синглтон
+│   │   ├── chat_model.py            ✅ LangChain-модель: stub (tool calling) | ChatOpenAI
+│   │   ├── tools.py                 ✅ search_knowledge_base (RAG как tool)
+│   │   ├── subagents.py             ✅ knowledge-подагент + обёртка в tool
+│   │   ├── usage.py                 ✅ AgentUsageCallbackHandler + итоги токенов/$ + final_answer
+│   │   └── agent.py                 ✅ create_agent supervisor + guardrails + bounded checkpointer
+│   ├── evals/                       ✅ этап 5 (срез)
+│   │   ├── dataset.py               ✅ офлайн-датасет (вопрос → tool → grounding)
+│   │   ├── graders.py               ✅ детерминированные грейдеры (trajectory/outcome)
+│   │   └── runner.py                ✅ прогон + агрегат (success, routing, $)
 │   ├── mcp/                         📋 этап 6
 │   │   └── server.py                     # FastMCP + streamable_http_app
 │   └── streaming/                   ✅ этап 7 (срез)
@@ -666,15 +742,20 @@ uop/
 │   ├── test_rag_retriever.py        ✅ индексация + гибридный поиск (RRF)
 │   ├── test_rag_context.py          ✅ бюджет контекста, дедуп, цитаты
 │   ├── test_rag_index_task.py       ✅ index_document: статусы, retry/DLQ
-│   └── test_documents_api.py        ✅ /v1/documents API
-└── evals/                           📋 датасет + раннер качества — фаза 2
+│   ├── test_documents_api.py        ✅ /v1/documents API
+│   ├── test_agents_chat_model.py    ✅ детерминированная LangChain-модель
+│   ├── test_agents_tools.py         ✅ RAG-tool
+│   ├── test_agents_agent.py         ✅ supervisor: subagent-as-tool, grounding, память
+│   ├── test_agent_task.py           ✅ run_agent: метрики, failed/DLQ
+│   ├── test_agents_api.py           ✅ /v1/agents (идемпотентность, retry, валидация)
+│   └── test_evals.py                ✅ грейдеры + eval-раннер
 ```
 
 > **Соответствие исходному скелету.** В первой версии карты требований были
 > `tasks/rag_index.py`, `tasks/agent_run.py`, `tasks/dlq.py`. Сейчас:
-> `agent_run.py` → `tasks/llm.py` (LLM-исполнение задачи; агентский граф — этап 5),
-> `dlq.py` → логика DLQ в `tasks/service.py`, `rag_index.py` → `tasks/rag_index.py`
-> (задача индексации RAG, реализована в этапе 4).
+> `agent_run.py` → `tasks/agent_run.py` (граф агента, этап 5), а LLM-исполнение
+> задачи → `tasks/llm.py`; `dlq.py` → логика DLQ в `tasks/service.py`;
+> `rag_index.py` → `tasks/rag_index.py` (индексация RAG, этап 4).
 
 ---
 
@@ -682,12 +763,15 @@ uop/
 
 **Фаза 2:**
 
-- `evals/` — датасет и раннер: faithfulness / relevance / latency / стоимость прогона.
+- `evals/`: LLM-judge поверх детерминированных грейдеров (faithfulness / relevance)
+  и RAG-специфичные метрики; прогон на реальной модели.
+- Агенты: long-term memory через `store` (cross-thread), `HumanInTheLoopMiddleware`
+  + resume, второй специализированный подагент, `SummarizationMiddleware` в проде.
 - RAG: нативные sparse-векторы/BM25 внутри Qdrant (Query API + fusion) вместо
   лексического RRF; опциональный кросс-энкодер-реранкер (по замеру, не по умолчанию).
 - RAG: загрузка из URL/файлов, `DELETE /v1/documents/{id}` и явный reindex.
-- Полноценный supervisor с двумя подагентами (в MVP — один tool-using агент).
 - Alembic-миграции вместо `create_all()`.
+- Postgres-checkpointer для графа агента (в MVP — `InMemorySaver`).
 - Kafka-брокер (`taskiq-aio-kafka`) как альтернатива Redis Streams.
 - WebSocket как второй транспорт стриминга рядом с SSE.
 - Langfuse Cloud / Prometheus / OTel Collector в `docker-compose.yml`.

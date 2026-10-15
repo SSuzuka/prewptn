@@ -98,9 +98,27 @@ def build_broker(settings: Settings | None = None) -> AsyncBroker:
 
 broker = build_broker()
 
+_broker_started = False
+
+
+async def ensure_broker_started() -> None:
+    """Start the broker exactly once per process.
+
+    Single guard shared by every `enqueue_*` helper: separate per-module flags
+    would call `broker.startup()` (and its worker-startup hooks) once per task
+    type. In production the worker starts the broker itself; this is for the
+    API/dev path where tasks are enqueued inline.
+    """
+    global _broker_started
+    if not _broker_started:
+        await broker.startup()
+        _broker_started = True
+
+
 # Регистрируем задачи на этом брокере. Импорт в конце файла — иначе цикл:
 # модули задач импортируют `broker` из этого модуля. Без этого воркер
 # (`taskiq worker aicore.broker:broker`) не знал бы ни одной задачи.
+from aicore.tasks import agent_run as _agent_run  # noqa: E402,F401
 from aicore.tasks import llm as _llm  # noqa: E402,F401
 from aicore.tasks import ping as _ping  # noqa: E402,F401
 from aicore.tasks import rag_index as _rag_index  # noqa: E402,F401

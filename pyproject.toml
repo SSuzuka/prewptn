@@ -41,8 +41,11 @@ postgres = [
 ]
 # Production-режим LLM: httpx-транспорт к OpenAI-совместимому endpoint.
 # Базовый `uv sync` не тянет его: dev/тесты работают на StubLLM без сети.
+# langchain-openai нужен агентам stage 5: `create_agent` работает с LangChain
+# `BaseChatModel`, а в проде это ChatOpenAI поверх того же endpoint'а.
 openai = [
     "httpx>=0.27,<0.29",
+    "langchain-openai>=1.0,<2",
 ]
 # Локальные эмбеддинги для RAG: fastembed (ONNX), бесплатно, без API-ключа.
 # Тяжёлая зависимость (onnxruntime), поэтому вынесена в отдельный extra:

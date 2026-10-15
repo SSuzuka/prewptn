@@ -22,6 +22,7 @@ BrokerBackend = Literal["memory", "redis"]
 VectorBackend = Literal["memory", "qdrant"]
 LLMBackend = Literal["stub", "openai"]
 EmbeddingBackend = Literal["stub", "local", "openai"]
+AgentBackend = Literal["stub", "openai"]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -116,6 +117,29 @@ class Settings(BaseSettings):
     # Бюджет контекста, который уходит в промпт (защита от «context cliff»).
     rag_context_max_chars: int = Field(default=6000, gt=0)
 
+    # --------------------------------------------------------------- агенты
+    # Агентный слой (LangChain 1.x `create_agent`: supervisor + subagents).
+    # Модель — LangChain `BaseChatModel`: `stub` — детерминированная
+    # tool-calling модель для dev и тестов (без сети и ключей), `openai` —
+    # ChatOpenAI поверх того же OpenAI-совместимого endpoint'а (extra `openai`).
+    agent_backend: AgentBackend = Field(
+        default="stub",
+        description="stub - детерминированный (dev/тесты), openai - ChatOpenAI endpoint",
+    )
+    agent_model: str = Field(default="gpt-4o-mini")
+    agent_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    # Guardrails цикла агента: защита от runaway-петель и неограниченных трат.
+    agent_max_model_calls: int = Field(default=10, ge=1)
+    agent_max_tool_calls: int = Field(default=15, ge=1)
+    # Лимит шагов графа (каждый шаг service/tools). Страховка поверх лимитов.
+    agent_recursion_limit: int = Field(default=25, ge=1)
+    # Сжатие истории при приближении к окну контекста. 0 — выключено
+    # (в dev/тестах на stub-модели сжатие не нужно).
+    agent_summarize_trigger_tokens: int = Field(default=0, ge=0)
+    # Предел числа веток (thread_id) в in-memory чекпойнтере: старейшие
+    # вытесняются, чтобы клиентский `thread_id` не раздувал память без границ.
+    agent_max_threads: int = Field(default=256, ge=1)
+
     # --------------------------------------------------------- надёжность
     task_max_retries: int = Field(default=3, ge=0)
     task_retry_delay_seconds: float = Field(default=5.0, gt=0)
@@ -193,6 +217,7 @@ class Settings(BaseSettings):
             self.broker_backend == "redis"
             or self.vector_backend == "qdrant"
             or self.llm_backend == "openai"
+            or self.agent_backend == "openai"
         )
 
     @property

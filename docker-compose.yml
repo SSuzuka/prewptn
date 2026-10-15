@@ -8,7 +8,7 @@
 # Чтобы перевести сервис в прод-режим, нужны:
 #   docker compose up -d postgres redis qdrant
 #   BROKER_BACKEND=redis  DB_URL=postgresql+asyncpg://...  VECTOR_BACKEND=qdrant
-#   uv sync --extra redis --extra postgres
+#   uv sync --extra redis --extra postgres --extra openai --extra embeddings
 #
 # Сервисы langfuse / prometheus / otel-collector закомментированы — они нужны
 # только для полного observability-стека и относятся к фазе 2.

@@ -15,6 +15,7 @@ from aicore.api.schemas import TaskCreateRequest, TaskView
 from aicore.db.session import get_session
 from aicore.logging import get_logger
 from aicore.streaming.events import stream_task_events
+from aicore.tasks.agent_run import enqueue_run_agent
 from aicore.tasks.llm import enqueue_answer_question
 from aicore.tasks.rag_index import enqueue_index_document
 from aicore.tasks.service import TaskService
@@ -30,6 +31,7 @@ IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key", max_lengt
 _ENQUEUERS: dict[str, Callable[[str], Awaitable[None]]] = {
     "answer_question": enqueue_answer_question,
     "index_document": enqueue_index_document,
+    "run_agent": enqueue_run_agent,
 }
 
 
@@ -56,6 +58,9 @@ async def create_task(
         task_type="answer_question",
         payload=body.model_dump(exclude_none=True),
         idempotency_key=idempotency_key,
+        # Отдельный скоуп на эндпоинт: иначе один и тот же `Idempotency-Key`,
+        # отправленный на /v1/tasks и /v1/agents, вернул бы задачу чужого типа.
+        idempotency_scope="tasks",
     )
     if created:
         # Коммитим ДО постановки в очередь: задача читает себя отдельной сессией
