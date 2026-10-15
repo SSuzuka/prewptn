@@ -51,8 +51,7 @@ class TestRunEvals:
         assert all("checks" in case for case in payload["results"])
         # Per-case metrics must be decomposable, not only aggregated.
         assert all(
-            {"tool_calls", "cost_usd", "model_calls"} <= set(case)
-            for case in payload["results"]
+            {"tool_calls", "cost_usd", "model_calls"} <= set(case) for case in payload["results"]
         )
 
     @pytest.mark.asyncio
@@ -63,9 +62,7 @@ class TestRunEvals:
         GraphRecursionError; отчёт обязан вернуться целиком, с ошибками по
         кейсам, а не выбросить исключение.
         """
-        report = await run_evals(
-            settings=Settings(rag_retrieve_limit=1, agent_recursion_limit=1)
-        )
+        report = await run_evals(settings=Settings(rag_retrieve_limit=1, agent_recursion_limit=1))
         assert report.total == len(DEFAULT_DATASET)
         assert report.passed == 0
         assert all(case.error for case in report.results)
