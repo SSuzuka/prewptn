@@ -20,6 +20,7 @@ from aicore.db.models import TaskRun
 from aicore.db.session import get_database
 from aicore.llm import LLMPermanentError, LLMRequest, get_llm_client
 from aicore.logging import get_logger
+from aicore.metrics import record_rag_fallback
 from aicore.tasks.service import TaskService
 
 logger = get_logger(__name__)
@@ -51,8 +52,10 @@ async def _run(task_id: str) -> dict[str, Any]:
         await svc.mark_running(task)
         payload = dict(task.payload or {})
 
+    question = str(payload.get("question", ""))
+    prompt = await _with_rag(question) if payload.get("use_rag") else question
     request = LLMRequest(
-        prompt=str(payload.get("question", "")),
+        prompt=prompt,
         system=payload.get("system"),
         max_tokens=payload.get("max_tokens"),
     )
@@ -84,6 +87,29 @@ async def _run(task_id: str) -> dict[str, Any]:
             cost_usd=response.cost_usd,
         )
     return result
+
+
+async def _with_rag(question: str) -> str:
+    """Prepend retrieved context to the question (opt-in via payload.use_rag).
+
+    Retrieval failures degrade gracefully: a broken vector store must not fail
+    the whole answer task, it just answers without context.
+    """
+    from aicore.rag import build_context, build_rag_prompt, get_retriever
+
+    try:
+        hits = await get_retriever().retrieve(question)
+    except Exception:  # noqa: BLE001 — деградируем до ответа без контекста
+        # Не логируем сам вопрос: он может содержать PII. Длины достаточно,
+        # чтобы отличить «пустой ввод» от реального сбоя ретрива.
+        logger.exception("rag.retrieve_failed", question_chars=len(question))
+        record_rag_fallback(reason="retrieve_error")
+        return question
+
+    bundle = build_context(hits, max_chars=get_settings().rag_context_max_chars)
+    if not bundle:
+        return question
+    return build_rag_prompt(question, bundle)
 
 
 async def _load(svc: TaskService, task_id: str) -> TaskRun | None:

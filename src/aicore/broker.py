@@ -103,3 +103,4 @@ broker = build_broker()
 # (`taskiq worker aicore.broker:broker`) не знал бы ни одной задачи.
 from aicore.tasks import llm as _llm  # noqa: E402,F401
 from aicore.tasks import ping as _ping  # noqa: E402,F401
+from aicore.tasks import rag_index as _rag_index  # noqa: E402,F401

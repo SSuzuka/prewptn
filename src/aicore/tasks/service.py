@@ -75,22 +75,25 @@ class TaskService:
             broker_task_id=broker_task_id,
             queued_at=utcnow(),
         )
-        self.session.add(task)
-
-        if idempotency_key:
-            # ВАЖНО: не передаём task_id вручную. На этот момент task.id ещё
-            # не сгенерирован (default=uuid4 срабатывает при flush), и ключ
-            # ушёл бы в БД с task_id=NULL — тогда ON DELETE CASCADE не на что
-            # вешать. Связь через relationship проставляет FK корректно.
-            self.session.add(
-                IdempotencyKey(key=idempotency_key, scope=idempotency_scope, task=task)
-            )
 
         try:
-            await self.session.flush()
+            # Savepoint (not a full rollback): a lost race must not discard other
+            # work the caller has already staged in this session. The pending
+            # INSERTs live inside the savepoint, so a rollback expunges them.
+            async with self.session.begin_nested():
+                self.session.add(task)
+
+                if idempotency_key:
+                    # ВАЖНО: не передаём task_id вручную. На этот момент task.id ещё
+                    # не сгенерирован (default=uuid4 срабатывает при flush), и ключ
+                    # ушёл бы в БД с task_id=NULL — тогда ON DELETE CASCADE не на что
+                    # вешать. Связь через relationship проставляет FK корректно.
+                    self.session.add(
+                        IdempotencyKey(key=idempotency_key, scope=idempotency_scope, task=task)
+                    )
+                await self.session.flush()
         except IntegrityError:
             # Параллельный запрос успел раньше — отдаём его задачу.
-            await self.session.rollback()
             existing = await self.get_task_by_idempotency_key(
                 idempotency_key, scope=idempotency_scope
             )

@@ -128,20 +128,24 @@ async def run_with_retry(
     *,
     on_retry: Callable[[int, BaseException, float], None] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    retry_on: type[BaseException] = LLMTransientError,
 ) -> T:
-    """Run ``operation``, retrying only :class:`LLMTransientError`.
+    """Run ``operation``, retrying only ``retry_on`` (transient by default).
 
-    Permanent errors and any non-LLM exception propagate immediately. Once the
+    Permanent errors and any other exception propagate immediately. Once the
     retries are exhausted the last transient error is re-raised, so the caller
     can decide between a task-level retry and a dead-letter.
 
-    ``sleep`` is injectable so tests exercise the backoff without real waits.
+    ``retry_on`` is exposed so peer provider layers (e.g. embeddings) can share
+    this well-tested loop with their own transient-error class instead of
+    duplicating it. ``sleep`` is injectable so tests exercise the backoff
+    without real waits.
     """
     attempt = 0
     while True:
         try:
             return await operation()
-        except LLMTransientError as exc:
+        except retry_on as exc:
             if attempt >= policy.max_retries:
                 raise
             delay = policy.delay_for(attempt)

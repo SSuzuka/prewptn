@@ -1,7 +1,7 @@
 """Сборка FastAPI-приложения.
 
-Пока это каркас: health-check и настройки. Роуты `/v1/tasks`, `/v1/documents`,
-`/metrics` и монтирование MCP-сервера добавляются в следующих этапах.
+Монтируются роуты health, задач (`/v1/tasks`), документов RAG
+(`/v1/documents`) и `/metrics`. MCP-сервер (этап 6) добавляется позже.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from aicore.api.routes import health, metrics, tasks
+from aicore.api.routes import documents, health, metrics, tasks
 from aicore.config import get_settings
 from aicore.db.session import get_database
 from aicore.logging import configure_logging, get_correlation_id, get_logger
@@ -54,6 +54,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router, tags=["health"])
     app.include_router(tasks.router, prefix="/v1", tags=["tasks"])
+    app.include_router(documents.router, prefix="/v1", tags=["documents"])
     app.include_router(metrics.router, tags=["metrics"])
 
     logger.info("app.configured", correlation_id=get_correlation_id())

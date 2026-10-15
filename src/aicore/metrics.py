@@ -46,6 +46,44 @@ LLM_LATENCY_MS = Histogram(
     buckets=(5, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000),
 )
 
+# --- embeddings / RAG ----------------------------------------------------
+EMBEDDINGS_TOTAL = Counter(
+    "aicore_embeddings_total",
+    "Successful embedding calls.",
+    ["backend", "model"],
+)
+EMBEDDING_TOKENS_TOTAL = Counter(
+    "aicore_embedding_tokens_total",
+    "Tokens embedded, by kind.",
+    ["kind"],
+)
+EMBEDDING_COST_USD_TOTAL = Counter(
+    "aicore_embedding_cost_usd_total",
+    "Accumulated embedding cost in USD.",
+    ["model"],
+)
+EMBEDDING_LATENCY_MS = Histogram(
+    "aicore_embedding_latency_ms",
+    "Embedding call latency in milliseconds.",
+    ["backend"],
+    buckets=(5, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000),
+)
+RAG_RETRIEVALS_TOTAL = Counter(
+    "aicore_rag_retrievals_total",
+    "Retrieval queries by hybrid mode.",
+    ["hybrid"],
+)
+RAG_RETURNED_CHUNKS = Histogram(
+    "aicore_rag_returned_chunks",
+    "Number of chunks returned per retrieval query.",
+    buckets=(0, 1, 2, 3, 5, 8, 13, 21, 34, 55),
+)
+RAG_FALLBACKS_TOTAL = Counter(
+    "aicore_rag_fallbacks_total",
+    "Retrievals that degraded to answering without context.",
+    ["reason"],
+)
+
 
 def record_task_status(task_type: str, status: str) -> None:
     """Count one task status transition (running/succeeded/pending/...)."""
@@ -72,3 +110,29 @@ def record_llm_call(
     LLM_TOKENS_TOTAL.labels(kind="completion").inc(completion_tokens)
     LLM_COST_USD_TOTAL.labels(model=model).inc(cost_usd)
     LLM_LATENCY_MS.labels(backend=backend).observe(latency_ms)
+
+
+def record_embedding_call(
+    *,
+    backend: str,
+    model: str,
+    tokens: int,
+    cost_usd: float,
+    latency_ms: int,
+) -> None:
+    """Record one successful embedding call."""
+    EMBEDDINGS_TOTAL.labels(backend=backend, model=model).inc()
+    EMBEDDING_TOKENS_TOTAL.labels(kind="embedding").inc(tokens)
+    EMBEDDING_COST_USD_TOTAL.labels(model=model).inc(cost_usd)
+    EMBEDDING_LATENCY_MS.labels(backend=backend).observe(latency_ms)
+
+
+def record_retrieval(*, hybrid: bool, returned: int) -> None:
+    """Count one retrieval query and observe how many chunks it returned."""
+    RAG_RETRIEVALS_TOTAL.labels(hybrid="on" if hybrid else "off").inc()
+    RAG_RETURNED_CHUNKS.observe(returned)
+
+
+def record_rag_fallback(*, reason: str) -> None:
+    """Count one retrieval that degraded to a context-less answer."""
+    RAG_FALLBACKS_TOTAL.labels(reason=reason).inc()

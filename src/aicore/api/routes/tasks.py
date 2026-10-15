@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from aicore.db.session import get_session
 from aicore.logging import get_logger
 from aicore.streaming.events import stream_task_events
 from aicore.tasks.llm import enqueue_answer_question
+from aicore.tasks.rag_index import enqueue_index_document
 from aicore.tasks.service import TaskService
 
 logger = get_logger(__name__)
@@ -22,6 +24,13 @@ router = APIRouter()
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key", max_length=255)]
+
+# Диспетчеризация ручного retry по типу задачи: каждый тип перезапускается
+# своим хендлером, иначе index_document ушёл бы в LLM-хендлер (и наоборот).
+_ENQUEUERS: dict[str, Callable[[str], Awaitable[None]]] = {
+    "answer_question": enqueue_answer_question,
+    "index_document": enqueue_index_document,
+}
 
 
 def _require_uuid(task_id: str) -> None:
@@ -75,13 +84,18 @@ async def retry_task(task_id: str, session: SessionDep) -> TaskView:
     task = await svc.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    enqueue = _ENQUEUERS.get(task.task_type)
+    if enqueue is None:
+        raise HTTPException(
+            status_code=409, detail=f"task type {task.task_type!r} cannot be retried"
+        )
     try:
         await svc.reset_for_retry(task)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     await session.commit()
-    await enqueue_answer_question(str(task.id))
+    await enqueue(str(task.id))
     await session.refresh(task)
     return TaskView.from_task(task)
 

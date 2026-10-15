@@ -33,6 +33,7 @@ _SECRET_KEYS = frozenset(
         "langfuse_secret_key",
         "langfuse_public_key",
         "openai_api_key",
+        "qdrant_api_key",
     }
 )
 

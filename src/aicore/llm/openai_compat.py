@@ -34,15 +34,12 @@ from aicore.llm.base import (
     compute_cost_usd,
     run_with_retry,
 )
+from aicore.llm.http_status import decode_json_object, raise_for_status
 from aicore.logging import get_logger
 from aicore.metrics import record_llm_call
 from aicore.telemetry import record_generation, span
 
 logger = get_logger(__name__)
-
-# Statuses worth retrying: request timeout/conflict, too-early, rate limit and
-# the transient 5xx family. Everything else in 4xx is a caller problem.
-_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 
 class OpenAICompatibleLLM:
@@ -120,8 +117,18 @@ class OpenAICompatibleLLM:
             except httpx.TransportError as exc:
                 raise LLMTransientError(f"llm transport error: {exc}") from exc
 
-        self._raise_for_status(http_response)
-        data = self._decode(http_response)
+        raise_for_status(
+            http_response,
+            label="llm",
+            transient_error=LLMTransientError,
+            permanent_error=LLMPermanentError,
+        )
+        data = decode_json_object(
+            http_response,
+            label="llm",
+            transient_error=LLMTransientError,
+            permanent_error=LLMPermanentError,
+        )
         text, usage = self._extract(data)
         latency_ms = int((perf_counter() - started) * 1000)
         return LLMResponse(
@@ -150,26 +157,6 @@ class OpenAICompatibleLLM:
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
         return payload
-
-    @staticmethod
-    def _raise_for_status(response: httpx.Response) -> None:
-        if response.status_code < 400:
-            return
-        message = f"llm HTTP {response.status_code}: {response.text[:500]}"
-        if response.status_code in _RETRYABLE_STATUS:
-            raise LLMTransientError(message)
-        raise LLMPermanentError(message)
-
-    @staticmethod
-    def _decode(response: httpx.Response) -> dict[str, Any]:
-        try:
-            data = response.json()
-        except ValueError as exc:
-            # A 2xx with a truncated body is a provider glitch, not our bug.
-            raise LLMTransientError(f"llm returned invalid JSON: {exc}") from exc
-        if not isinstance(data, dict):
-            raise LLMPermanentError("llm returned a non-object JSON body")
-        return data
 
     @staticmethod
     def _extract(data: dict[str, Any]) -> tuple[str, LLMUsage]:

@@ -14,7 +14,7 @@ Backend-сервис, который принимает AI-задачу, про�
 > | 1 | `config.py`, `logging.py`, health-check + live-сервер | ✅ |
 > | 2 | БД + брокер: статусы, retries, idempotency, DLQ | ✅ |
 > | 3 | LLM-слой: timeouts, rate limit, учёт токенов и стоимости | ✅ |
-> | 4 | RAG: chunking → embeddings → Qdrant → контекст | 📋 |
+> | 4 | RAG: chunking → embeddings → Qdrant → контекст | ✅ |
 > | 5 | Агенты: `create_agent` + supervisor-граф на LangGraph | 📋 |
 > | 6 | MCP-сервер + монтирование в FastAPI | 📋 |
 > | 7 | API + SSE-стриминг + `/metrics` | 🚧 срез |
@@ -24,8 +24,9 @@ Backend-сервис, который принимает AI-задачу, про�
 > `fastapi 0.143+`, `langfuse 5+`, `mcp 2+` или `sqlalchemy 2.1+`, они упадут
 > (см. `tests/test_smoke_imports.py`).
 >
-> Реализован сквозной срез: `/v1/tasks` (создание/статус/retry), SSE-стриминг и
-> `/metrics` — офлайн, на StubLLM. RAG (этап 4), агенты (5) и MCP (6) отложены.
+> Реализован сквозной срез: `/v1/tasks` (создание/статус/retry), SSE-стриминг,
+> `/metrics` и RAG (`/v1/documents`: индексация + retrieval) — офлайн, на
+> StubLLM и детерминированном stub-эмбеддере. Агенты (5) и MCP (6) отложены.
 
 ---
 
@@ -49,13 +50,14 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 169 тестов
+uv run pytest                        # 220 тестов
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
 uv run python scripts/demo.py            # конфиг, логи, health-check
 uv run python scripts/check_stage1.py    # config + logging
 uv run python scripts/check_stage2.py    # БД, брокер, retries, DLQ
 uv run python scripts/check_stage3.py    # LLM: timeout, retries, токены, стоимость
+uv run python scripts/check_stage4.py    # RAG: chunking, embeddings, Qdrant, retrieval
 uv run python scripts/check_server.py    # uvicorn + сквозной путь задачи (POST/SSE/metrics)
 ```
 
@@ -147,8 +149,12 @@ Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> 
 6. Итог → `succeeded` (с метриками). Если retries исчерпаны → `dead_letter` +
    ручной `POST /v1/tasks/{id}/retry`.
 
-RAG (этап 4) и LangGraph-supervisor с подагентами (этап 5) в этот срез не входят —
-сейчас шаг 4 это прямой вызов LLM, а не агентский граф.
+RAG (этап 4) реализован как отдельная подсистема: документы индексируются через
+`/v1/documents`, а ответ можно «заземлить» контекстом, поставив `use_rag=true`
+(тогда перед вызовом LLM подмешиваются retrieved-чанки; retrieval-ошибка
+деградирует до ответа без контекста, не роняя задачу). LangGraph-supervisor с
+подагентами (этап 5) в этот срез не входит — сейчас шаг 4 это прямой вызов LLM,
+а не агентский граф.
 
 ---
 
@@ -170,13 +176,14 @@ RAG (этап 4) и LangGraph-supervisor с подагентами (этап 5) 
 | `GET` | `/v1/tasks/{id}/stream` | **SSE**-поток событий выполнения (`status`/`done`/`error`) | ✅ |
 | `POST` | `/v1/tasks/{id}/retry` | ручной перезапуск упавшей задачи | ✅ |
 | `GET` | `/metrics` | Prometheus-метрики (latency, счётчики, стоимость) | ✅ |
+| `POST` | `/v1/documents` | загрузка документа → задача индексации в RAG (идемпотентно по содержимому) | ✅ |
+| `GET` | `/v1/documents` | список документов RAG | ✅ |
+| `GET` | `/v1/documents/{id}` | статус индексации документа | ✅ |
 
-**Целевой API (этапы 4–6):**
+**Целевой API (этапы 5–6):**
 
 | Метод | Путь | Назначение | Статус |
 |---|---|---|---|
-| `POST` | `/v1/documents` | загрузка документа → задача индексации в RAG | 📋 этап 4 |
-| `GET` | `/v1/documents/{id}` | статус индексации документа | 📋 этап 4 |
 | `/mcp` | — | Streamable HTTP эндпоинт MCP-сервера | 📋 этап 6 |
 
 Сквозной сценарий (работает уже сейчас, офлайн):
@@ -199,6 +206,22 @@ curl -N  http://127.0.0.1:8000/v1/tasks/<id>/stream
 curl -sS http://127.0.0.1:8000/metrics | grep aicore_
 ```
 
+Сквозной RAG-сценарий (индексация + ответ с контекстом):
+
+```bash
+# Загрузить документ — вернётся задача индексации, статус документа в фоне
+curl -sS -X POST http://127.0.0.1:8000/v1/documents \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "Intro", "content": "Idempotency keys avoid duplicate LLM spend."}'
+
+curl -sS http://127.0.0.1:8000/v1/documents/<id>   # status: indexed, chunk_count
+
+# Ответ, «заземлённый» retrieved-контекстом
+curl -sS -X POST http://127.0.0.1:8000/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "how to avoid duplicate spend?", "use_rag": true}'
+```
+
 ---
 
 ## Конфигурация
@@ -214,6 +237,7 @@ broker_backend:  Literal["memory", "redis"]  = "memory"
 db_url:          str = "sqlite+aiosqlite:///./local.db"
 vector_backend:  Literal["memory", "qdrant"] = "memory"
 llm_backend:     Literal["stub", "openai"]   = "stub"
+embedding_backend: Literal["stub", "local", "openai"] = "stub"
 db_echo:         bool = False          # SQL-лог (шумно, только для отладки)
 
 # --- очередь и ретраи ---
@@ -232,6 +256,18 @@ llm_max_retries:      int   = 3
 llm_retry_base_delay: float = 1.0
 llm_price_prompt_per_1k:     float = 0.00015   # USD, для метрик стоимости
 llm_price_completion_per_1k: float = 0.0006
+
+# --- RAG ---
+embedding_model:       str   = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # для local (fastembed)
+embedding_dim:         int   = 384      # размер вектора; должен совпасть с моделью
+embedding_timeout_seconds: float = 30.0
+embedding_max_retries: float = 3
+rag_chunk_size:        int   = 1000     # символы (~4 символа на токен)
+rag_chunk_overlap:     int   = 100
+rag_retrieve_limit:    int   = 5        # топ-k чанков в контекст
+rag_retrieve_fetch_k:  int   = 20       # пул кандидатов до ранжирования
+rag_hybrid_enabled:    bool  = True     # плотный поиск + лексический ранк (RRF)
+rag_context_max_chars: int   = 6000     # бюджет контекста в промпте
 
 # --- API ---
 api_host:  str = "127.0.0.1"
@@ -274,6 +310,7 @@ langfuse_secret_key:  str | None = None
 | БД | `sqlite+aiosqlite` | **только** PostgreSQL + `asyncpg` |
 | Векторный поиск | `AsyncQdrantClient(":memory:")` | Qdrant-сервер |
 | LLM | `StubLLM` (детерминированный, без ключей) | OpenAI-совместимый endpoint |
+| Эмбеддинги | `StubEmbeddings` (хэш, без сети и ключей) | `local` (fastembed, бесплатно) или OpenAI-совместимый `/embeddings` |
 
 **Почему `InMemoryBroker` нельзя брать в прод.** Он исполняет задачи в текущем
 процессе: сообщения не ходят по сети, нет acknowledge и redelivery, часть
@@ -301,7 +338,12 @@ BROKER_BACKEND=redis
 DB_URL=postgresql+asyncpg://user:pass@localhost:5432/aicore
 VECTOR_BACKEND=qdrant
 LLM_BACKEND=openai
+EMBEDDING_BACKEND=local   # бесплатные локальные эмбеддинги (fastembed), либо openai
 ```
+
+`EMBEDDING_BACKEND=local` скачивает ONNX-модель один раз при первом использовании
+(кэш — `FASTEMBED_CACHE_PATH`, в образе уже writable) и работает без API-ключа и
+без оплаты за токены; `openai` шлёт в OpenAI-совместимый `/embeddings`.
 
 Опциональные extras (чтобы базовый `uv sync` оставался лёгким):
 
@@ -309,6 +351,7 @@ LLM_BACKEND=openai
 uv sync --extra redis      # taskiq-redis, прод-брокер
 uv sync --extra postgres   # asyncpg, прод-БД
 uv sync --extra openai     # httpx, транспорт к OpenAI-совместимому endpoint
+uv sync --extra embeddings # fastembed (ONNX): бесплатные локальные эмбеддинги
 ```
 
 `docker-compose.yml` в MVP намеренно **не запускается** — он лежит как
@@ -334,7 +377,7 @@ uv sync --extra openai     # httpx, транспорт к OpenAI-совмест�
 только после успешных `test` и `docker`.
 
 Образ из `Dockerfile` (multi-stage, uv) содержит **оба** процесса — API и воркер;
-прод-extras (`redis`/`postgres`/`openai`) уже внутри. Теги: `main`/`latest`,
+прод-extras (`redis`/`postgres`/`openai`/`embeddings`) уже внутри. Теги: `main`/`latest`,
 semver-тег и короткий `sha`.
 
 ```bash
@@ -458,6 +501,44 @@ Postgres или LLM-ключа: используется `InMemoryBroker`, `sqli
 инфраструктура, помечены маркером `@pytest.mark.integration` и по умолчанию
 пропускаются.
 
+**Эмбеддинги — отдельный контракт, не часть LLM-слоя.** RAG зависит от
+протокола `EmbeddingClient` с тем же устройством, что `LLMClient`: три бэкенда
+(`stub` детерминированный, `local` fastembed ONNX — бесплатно и без ключа,
+`openai` — любой `/embeddings`), разделение transient/permanent ошибок и общий
+цикл ретраев (`run_with_retry(retry_on=...)`). Вызывающий код не ветвится по
+бэкенду, а `fastembed` живёт в extra `embeddings`, чтобы базовый `uv sync`
+оставался лёгким.
+
+**Чанкинг влияет на качество не меньше модели.** Размер и границы чанка задают
+потолок того, что ретривер вообще сможет найти. По умолчанию — рекурсивное
+разбиение по абзацам/предложениям/словам в диапазон ~200–800 токенов
+(1000/100 символов ≈ 250/25 токенов, ~4 символа на токен), с малым
+перекрытием: большое перекрытие в основном дублирует индекс и жжёт эмбеддинги
+без измеримого прироста recall.
+
+**Детерминированный point id → идемпотентная реиндексация.** id чанка —
+`uuid5(document_id, chunk_index)`, поэтому повторная индексация документа
+**перезаписывает** его точки, а не плодит дубли (та же идея, что
+`Idempotency-Key` у задач и `content_hash` у документа).
+
+**Гибридный поиск через RRF, а не «чистая семантика».** Плотный поиск
+пропускает точные токены (коды ошибок, идентификаторы, имена функций), а
+лексический — общую семантику. Ранжирования объединяются reciprocal rank
+fusion: не нужна калибровка скоров, работает детерминированно и офлайн, в том
+числе на `:memory:`-хранилище. Полноценные sparse-векторы/BM25 внутри Qdrant —
+апгрейд фазы 2.
+
+**Контекст — это шаг с бюджетом, а не `join(top_k)`.** Наивная склейка top-k
+раздувает промпт до 10k–30k токенов и роняет качество («context cliff»).
+`build_context` дедуплицирует чанки, нумерует их для цитирования и не
+превышает `rag_context_max_chars`; обязательное реранжирование — не догма (в
+публичных бенчмарках оно местами вредит), поэтому здесь его нет, есть гибрид.
+
+**`Document` хранит метаданные, текст — в payload задачи.** Колонки `content`
+нет намеренно: чанки живут в векторном хранилище, а исходный текст — входной
+параметр задания индексации. Идемпотентность загрузки — по `content_hash`
+(уникален), поэтому повторная загрузка того же текста не жжёт эмбеддинги.
+
 ---
 
 ## Технологический стек
@@ -473,6 +554,7 @@ Postgres или LLM-ключа: используется `InMemoryBroker`, `sqli
 | БД | SQLAlchemy · aiosqlite · asyncpg *(extra)* | `>=2.0,<2.1` · `>=0.20,<0.23` · `>=0.30,<0.33` |
 | Агенты | langchain · langgraph | `>=1.0,<2` · `>=1.0,<2` |
 | RAG | qdrant-client | `>=1.10,<2` |
+| RAG эмбеддинги | fastembed *(extra)* | `>=0.4,<1` |
 | LLM | httpx *(extra `openai`)* | `>=0.27,<0.29` |
 | Наблюдаемость | langfuse · structlog · prometheus-client · opentelemetry-sdk | `>=4.17,<5` · `>=24,<27` · `>=0.20,<1` · `>=1.27,<2` |
 | Инструменты | mcp | `>=1.28,<2` |
@@ -506,6 +588,7 @@ uop/
 │   ├── check_stage1.py              ✅ проверка config + logging
 │   ├── check_stage2.py              ✅ проверка БД, брокера, retries, DLQ
 │   ├── check_stage3.py              ✅ проверка LLM: timeout, retries, токены, $
+│   ├── check_stage4.py              ✅ проверка RAG: chunking, embeddings, Qdrant, retrieval
 │   └── check_server.py              ✅ поднимает uvicorn и бьёт по API
 ├── src/aicore/
 │   ├── __init__.py                  ✅
@@ -520,6 +603,7 @@ uop/
 │   │       ├── __init__.py          ✅
 │   │       ├── health.py            ✅ /health /ready /version
 │   │       ├── tasks.py             ✅ /v1/tasks (+retry, SSE)
+│   │       ├── documents.py         ✅ /v1/documents (загрузка/статус/список)
 │   │       └── metrics.py           ✅ /metrics
 │   ├── broker.py                    ✅ InMemory | RedisStream + SmartRetryMiddleware
 │   ├── db/                          ✅ этап 2
@@ -531,7 +615,8 @@ uop/
 │   │   ├── __init__.py              ✅
 │   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ
 │   │   ├── ping.py                  ✅ задача-образец с ретраями
-│   │   └── llm.py                   ✅ answer_question: LLM + метрики в TaskRun
+│   │   ├── llm.py                   ✅ answer_question: LLM + метрики в TaskRun
+│   │   └── rag_index.py             ✅ index_document: chunking → embed → Qdrant
 │   ├── telemetry.py                 ✅ OpenTelemetry + langfuse get_client() — этап 3
 │   ├── metrics.py                   ✅ Prometheus: счётчики/гистограммы задач и LLM
 │   ├── llm/                         ✅ этап 3
@@ -539,8 +624,16 @@ uop/
 │   │   ├── base.py                  ✅ LLMRequest/Response, ошибки, cost, retry-политика
 │   │   ├── stub.py                  ✅ детерминированный StubLLM (dev/тесты)
 │   │   └── openai_compat.py         ✅ timeout, retry, семафор, токены/$
-│   ├── rag/                         📋 этап 4
-│   │   ├── chunking.py embeddings.py store.py retriever.py context.py
+│   ├── rag/                         ✅ этап 4
+│   │   ├── __init__.py              ✅ фабрика эмбеддера + синглтоны
+│   │   ├── base.py                  ✅ EmbeddingClient, ошибки, стоимость
+│   │   ├── stub.py                  ✅ детерминированные хэш-эмбеддинги (dev/тесты)
+│   │   ├── embeddings.py            ✅ local (fastembed) + OpenAI-совместимый
+│   │   ├── chunking.py              ✅ рекурсивный сплиттер + estimate_tokens
+│   │   ├── store.py                 ✅ Qdrant (memory | server), point ids, delete
+│   │   ├── retriever.py             ✅ index + гибридный поиск (RRF)
+│   │   ├── context.py               ✅ сборка контекста с бюджетом и цитатами
+│   │   └── documents.py             ✅ DocumentService: статусы, content_hash
 │   ├── agents/                      📋 этап 5
 │   │   ├── state.py graph.py tools.py memory.py  # create_agent + supervisor
 │   ├── mcp/                         📋 этап 6
@@ -566,15 +659,22 @@ uop/
 │   ├── test_api_tasks.py            ✅ API задач (создание/идемпотентность/retry)
 │   ├── test_streaming.py            ✅ SSE-поток по шагам
 │   ├── test_metrics.py              ✅ /metrics + инструментирование
-│   └── test_rate_limit.py           ✅ 429 после лимита
+│   ├── test_rate_limit.py           ✅ 429 после лимита
+│   ├── test_rag_chunking.py         ✅ чанкинг: границы, размер, перекрытие
+│   ├── test_rag_embeddings.py       ✅ stub + OpenAI-совместимый эмбеддер
+│   ├── test_rag_store.py            ✅ Qdrant :memory: (upsert/search/delete)
+│   ├── test_rag_retriever.py        ✅ индексация + гибридный поиск (RRF)
+│   ├── test_rag_context.py          ✅ бюджет контекста, дедуп, цитаты
+│   ├── test_rag_index_task.py       ✅ index_document: статусы, retry/DLQ
+│   └── test_documents_api.py        ✅ /v1/documents API
 └── evals/                           📋 датасет + раннер качества — фаза 2
 ```
 
 > **Соответствие исходному скелету.** В первой версии карты требований были
 > `tasks/rag_index.py`, `tasks/agent_run.py`, `tasks/dlq.py`. Сейчас:
 > `agent_run.py` → `tasks/llm.py` (LLM-исполнение задачи; агентский граф — этап 5),
-> `dlq.py` → логика DLQ в `tasks/service.py`, `rag_index.py` → задача индексации
-> RAG (этап 4, пока не реализована).
+> `dlq.py` → логика DLQ в `tasks/service.py`, `rag_index.py` → `tasks/rag_index.py`
+> (задача индексации RAG, реализована в этапе 4).
 
 ---
 
@@ -583,6 +683,9 @@ uop/
 **Фаза 2:**
 
 - `evals/` — датасет и раннер: faithfulness / relevance / latency / стоимость прогона.
+- RAG: нативные sparse-векторы/BM25 внутри Qdrant (Query API + fusion) вместо
+  лексического RRF; опциональный кросс-энкодер-реранкер (по замеру, не по умолчанию).
+- RAG: загрузка из URL/файлов, `DELETE /v1/documents/{id}` и явный reindex.
 - Полноценный supervisor с двумя подагентами (в MVP — один tool-using агент).
 - Alembic-миграции вместо `create_all()`.
 - Kafka-брокер (`taskiq-aio-kafka`) как альтернатива Redis Streams.

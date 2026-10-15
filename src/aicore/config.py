@@ -15,12 +15,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BrokerBackend = Literal["memory", "redis"]
 VectorBackend = Literal["memory", "qdrant"]
 LLMBackend = Literal["stub", "openai"]
+EmbeddingBackend = Literal["stub", "local", "openai"]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,6 +60,9 @@ class Settings(BaseSettings):
     )
     qdrant_url: str = Field(default="http://localhost:6333")
     qdrant_collection: str = Field(default="aicore_documents")
+    qdrant_api_key: str | None = Field(
+        default=None, description="Ключ Qdrant Cloud; пусто для локального сервера"
+    )
     embedding_dim: int = Field(default=384, ge=1)
 
     # ----------------------------------------------------------------- LLM
@@ -75,6 +79,42 @@ class Settings(BaseSettings):
     # Цена за 1000 токенов в USD — для метрик стоимости.
     llm_price_prompt_per_1k: float = Field(default=0.00015, ge=0)
     llm_price_completion_per_1k: float = Field(default=0.0006, ge=0)
+
+    # ----------------------------------------------------------------- RAG
+    # Эмбеддинги — отдельный контракт со своим бэкендом.
+    #   stub  — детерминированные хэш-эмбеддинги (dev/тесты, без сети и ключей);
+    #   local — fastembed (ONNX), бесплатно и локально, без API-ключа (extra `embeddings`);
+    #   openai — любой OpenAI-совместимый /embeddings (extra `openai`).
+    embedding_backend: EmbeddingBackend = Field(
+        default="stub",
+        description="stub - детерминированный (dev), local - fastembed ONNX, openai - endpoint",
+    )
+    # Для local это имя модели fastembed. Дефолт — мультиязычная модель (в т.ч.
+    # русский), 384 измерения, ~220 МБ: компромисс «работает офлайн и на CPU».
+    embedding_model: str = Field(
+        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+    embedding_timeout_seconds: float = Field(default=30.0, gt=0)
+    embedding_max_concurrency: int = Field(default=8, ge=1)
+    embedding_max_retries: int = Field(default=3, ge=0)
+    embedding_retry_base_delay: float = Field(default=1.0, gt=0)
+    # Цена за 1000 токенов эмбеддингов (у локальных моделей 0).
+    embedding_price_per_1k: float = Field(default=0.0, ge=0)
+
+    # Параметры чанкинга (в символах; ~4 символа на токен).
+    rag_chunk_size: int = Field(default=1000, gt=0)
+    rag_chunk_overlap: int = Field(default=100, ge=0)
+
+    # Поиск: сколько чанков вернуть и из какого пула кандидатов.
+    rag_retrieve_limit: int = Field(default=5, ge=1)
+    rag_retrieve_fetch_k: int = Field(default=20, ge=1)
+    rag_min_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Гибрид: плотный поиск + лексический ранк через reciprocal rank fusion.
+    rag_hybrid_enabled: bool = Field(default=True)
+    rag_rrf_k: int = Field(default=60, gt=0)
+
+    # Бюджет контекста, который уходит в промпт (защита от «context cliff»).
+    rag_context_max_chars: int = Field(default=6000, gt=0)
 
     # --------------------------------------------------------- надёжность
     task_max_retries: int = Field(default=3, ge=0)
@@ -122,6 +162,20 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {allowed}, got {value!r}")
         return upper
 
+    @model_validator(mode="after")
+    def _validate_rag_chunking(self) -> Settings:
+        """Overlap >= size would never advance and breaks the chunker.
+
+        `chunk_text` rejects this combination, but failing at config load is far
+        better than a worker error that leaves a document stuck in `indexing`.
+        """
+        if self.rag_chunk_overlap >= self.rag_chunk_size:
+            raise ValueError(
+                "rag_chunk_overlap must be smaller than rag_chunk_size "
+                f"({self.rag_chunk_overlap} >= {self.rag_chunk_size})"
+            )
+        return self
+
     # -------------------------------------------------------------- свойства
     @property
     def langfuse_enabled(self) -> bool:
@@ -148,7 +202,12 @@ class Settings(BaseSettings):
     def redacted_dict(self) -> dict[str, object]:
         """Снимок конфигурации для логов — без секретов."""
         data: dict[str, object] = self.model_dump()
-        for key in ("langfuse_secret_key", "langfuse_public_key", "openai_api_key"):
+        for key in (
+            "langfuse_secret_key",
+            "langfuse_public_key",
+            "openai_api_key",
+            "qdrant_api_key",
+        ):
             if data.get(key):
                 data[key] = "***"
         db_url = data.get("db_url")
