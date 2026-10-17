@@ -17,6 +17,7 @@ Both share the transient/permanent retry loop from the LLM layer via
 from __future__ import annotations
 
 import asyncio
+import threading
 from time import perf_counter
 from typing import Any
 
@@ -71,10 +72,16 @@ class LocalEmbeddings:
         # первого вызова ``embed``: он идёт через ``asyncio.to_thread``, поэтому
         # скачивание не блокирует event loop и параллельные запросы.
         self._embedder: Any | None = None
+        # ``_embed_sync`` исполняется в рабочем потоке, поэтому защищаем ленивую
+        # инициализацию потоковым локом: два параллельных ``embed`` иначе
+        # построили бы модель дважды (повторное скачивание и лишняя память).
+        self._embedder_lock = threading.Lock()
 
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         if self._embedder is None:
-            self._embedder = self._text_embedding_cls(model_name=self.model)
+            with self._embedder_lock:
+                if self._embedder is None:
+                    self._embedder = self._text_embedding_cls(model_name=self.model)
         vectors = [[float(value) for value in vector] for vector in self._embedder.embed(texts)]
         if vectors:
             actual = len(vectors[0])

@@ -24,6 +24,7 @@ from aicore.broker import broker, ensure_broker_started
 from aicore.config import get_settings
 from aicore.db.session import get_database
 from aicore.logging import get_logger
+from aicore.metrics import record_enqueue_failed
 from aicore.tasks._common import load_task, mark_task_failed
 from aicore.tasks.service import TaskService
 
@@ -48,13 +49,16 @@ async def _run(task_id: str) -> dict[str, Any]:
     db = get_database()
     await db.ensure_ready()
 
-    # Фаза 1: загрузить задачу, отметить running, отпустить соединение.
+    # Фаза 1: загрузить задачу, атомарно заклеймить её, отпустить соединение.
     async with db.session() as session:
         svc = TaskService(session)
         task = await load_task(svc, task_id)
         if task is None:
             return {"status": "failed", "task_id": task_id, "error": "task not found"}
-        await svc.mark_running(task)
+        if not await svc.mark_running(task):
+            # Задачу уже выполняет другой воркер или она завершена: не перезаписываем
+            # терминальный статус и не платим за граф повторно.
+            return {"status": "skipped", "task_id": task_id, "error": "task is not pending"}
         payload = dict(task.payload or {})
         attempts = task.attempts
 
@@ -64,6 +68,11 @@ async def _run(task_id: str) -> dict[str, Any]:
         # API-слой отсекает пустой вопрос (min_length=1), но прямой вызов
         # create_task(payload={"question": ""}) дошёл бы сюда: пустой ввод
         # неисправим ретраем, поэтому сразу dead-letter, а не прогон графа.
+        # Проверка идёт ПОСЛЕ claim (см. фазу 1), поэтому неисправимый ввод
+        # стоит одной попытки (attempts=1, PENDING -> RUNNING -> DEAD_LETTER).
+        # Это осознанный размен: терминальный статус пишется только по уже
+        # заклеймлённой задаче, а не поверх параллельного воркера. Так же в
+        # tasks/llm.py — ради консистентности хендлеров.
         await mark_task_failed(task_id, "ValueError: question must not be empty", retryable=False)
         return {"status": "dead_letter", "task_id": task_id, "error": "empty question"}
 
@@ -149,3 +158,4 @@ async def enqueue_run_agent(task_id: str) -> None:
         await run_agent.kiq(task_id)
     except Exception:  # noqa: BLE001 — ошибку уже зафиксировали в БД
         logger.exception("task.enqueue_failed", task_id=task_id)
+        record_enqueue_failed("run_agent")

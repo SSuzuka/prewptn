@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -139,7 +139,15 @@ class TaskService:
     async def list_tasks(
         self, *, status: TaskStatus | None = None, limit: int = 50, offset: int = 0
     ) -> list[TaskRun]:
-        stmt = select(TaskRun).order_by(TaskRun.created_at.desc()).limit(limit).offset(offset)
+        stmt = (
+            select(TaskRun)
+            # `id` as a tiebreaker: `created_at` can collide (same second on
+            # SQLite), and without a total order offset pagination can drop or
+            # duplicate rows.
+            .order_by(TaskRun.created_at.desc(), TaskRun.id)
+            .limit(limit)
+            .offset(offset)
+        )
         if status is not None:
             stmt = stmt.where(TaskRun.status == status)
         result = await self.session.execute(stmt)
@@ -150,12 +158,36 @@ class TaskService:
         return await self.list_tasks(status=TaskStatus.DEAD_LETTER, limit=limit)
 
     # ------------------------------------------------------------ переходы
-    async def mark_running(self, task: TaskRun) -> TaskRun:
-        """Отметить начало обработки и инкрементировать счётчик попыток."""
-        task.status = TaskStatus.RUNNING
-        task.attempts += 1
-        task.started_at = utcnow()
-        await self.session.flush()
+    async def mark_running(self, task: TaskRun) -> bool:
+        """Atomically claim a PENDING task for execution.
+
+        The transition is a single conditional ``UPDATE ... WHERE status='pending'``
+        so that under at-least-once delivery (taskiq redelivery, several workers)
+        exactly one caller wins and the rest see ``rowcount == 0``. Without this,
+        a redelivered message could re-run — and overwrite — a task that already
+        reached a terminal status, double-charging the LLM/embeddings.
+
+        Returns ``True`` when this caller claimed the task, ``False`` when it was
+        not ``PENDING`` (already running or terminal), in which case the caller
+        must not execute the work.
+        """
+        result = await self.session.execute(
+            update(TaskRun)
+            .where(TaskRun.id == task.id, TaskRun.status == TaskStatus.PENDING)
+            .values(
+                status=TaskStatus.RUNNING,
+                attempts=TaskRun.attempts + 1,
+                started_at=utcnow(),
+            )
+            # The value for `attempts` is a SQL expression, so let the DB apply it
+            # and re-read the row instead of syncing the identity map in Python.
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            logger.warning("task.claim_rejected", task_id=str(task.id))
+            return False
+
+        await self.session.refresh(task)
         record_task_status(task.task_type, task.status.value)
         logger.info(
             "task.running",
@@ -163,7 +195,7 @@ class TaskService:
             attempt=task.attempts,
             max_attempts=task.max_attempts,
         )
-        return task
+        return True
 
     async def mark_succeeded(
         self,

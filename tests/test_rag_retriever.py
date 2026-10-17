@@ -92,3 +92,41 @@ class TestIndex:
         assert first == second
         assert await engine.store.count() == first
         await engine.aclose()
+
+
+class TestCyrillicLexical:
+    def test_tokens_keep_cyrillic(self) -> None:
+        """Регресс: `[a-z0-9]+` выкидывал кириллицу и делал лексику no-op."""
+        from aicore.rag.retriever import _tokens
+
+        assert _tokens("Ошибка Авторизации") == {"ошибка", "авторизации"}
+
+    def test_fuse_promotes_cyrillic_lexical_match(self) -> None:
+        from aicore.rag.retriever import _fuse
+        from aicore.rag.store import SearchHit
+
+        hits = [
+            SearchHit(
+                id="a",
+                score=0.95,
+                text="совсем другой текст про выпечку хлеба",
+                document_id="a",
+                chunk_index=0,
+            ),
+            SearchHit(
+                id="b",
+                score=0.9,
+                text="ошибка авторизации в базе данных",
+                document_id="b",
+                chunk_index=0,
+            ),
+            SearchHit(
+                id="c",
+                score=0.85,
+                text="ошибка авторизации и доступ к данным",
+                document_id="c",
+                chunk_index=0,
+            ),
+        ]
+        fused = _fuse(hits, "ошибка авторизации", rrf_k=60)
+        assert fused[0].id == "b"

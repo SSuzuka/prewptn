@@ -15,6 +15,7 @@ so the store stays a thin, swappable adapter.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -78,6 +79,9 @@ class VectorStore:
         self._collection = collection
         self._dimension = dimension
         self._ensured = False
+        # Guards the check-then-act in ensure_collection: several coroutines can
+        # reach it concurrently (index + retrieve on a cold store).
+        self._ensure_lock = asyncio.Lock()
 
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> VectorStore:
@@ -104,6 +108,12 @@ class VectorStore:
         """Create the collection once, or validate an existing one."""
         if self._ensured:
             return
+        async with self._ensure_lock:
+            if self._ensured:
+                return
+            await self._ensure_collection_locked()
+
+    async def _ensure_collection_locked(self) -> None:
         exists = await self._client.collection_exists(self._collection)
         if not exists:
             try:
@@ -117,9 +127,10 @@ class VectorStore:
                     dimension=self._dimension,
                 )
             except Exception:
-                # Check-then-create is racy: another process (or coroutine on the
-                # same instance) may have created it first. Tolerate that only
-                # when the collection now exists; otherwise the error is real.
+                # Check-then-create is racy: another process (not just another
+                # coroutine — the lock is per-instance) may have created it first.
+                # Tolerate that only when the collection now exists; otherwise the
+                # error is real.
                 if not await self._client.collection_exists(self._collection):
                     raise
                 await self._assert_dimension()

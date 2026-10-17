@@ -22,6 +22,11 @@ TASK_LATENCY_MS = Histogram(
     ["task_type"],
     buckets=(5, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000),
 )
+ENQUEUE_FAILURES_TOTAL = Counter(
+    "aicore_enqueue_failures_total",
+    "Tasks committed to the DB but not enqueued (broker enqueue failed).",
+    ["task_type"],
+)
 
 # --- LLM -----------------------------------------------------------------
 LLM_CALLS_TOTAL = Counter(
@@ -93,6 +98,15 @@ def record_task_status(task_type: str, status: str) -> None:
 def record_task_latency(task_type: str, latency_ms: int) -> None:
     """Observe end-to-end latency for a finished task."""
     TASK_LATENCY_MS.labels(task_type=task_type).observe(latency_ms)
+
+
+def record_enqueue_failed(task_type: str) -> None:
+    """Count a task that was committed but could not be enqueued.
+
+    The row stays PENDING with no queue message, so this counter is the alerting
+    signal that a sweeper/outbox is needed.
+    """
+    ENQUEUE_FAILURES_TOTAL.labels(task_type=task_type).inc()
 
 
 def record_llm_call(

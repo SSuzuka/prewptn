@@ -29,7 +29,11 @@ from aicore.rag.store import SearchHit, VectorPoint, VectorStore, make_point_id
 
 logger = get_logger(__name__)
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Unicode-aware tokenisation: `[^\W_]` is "word characters except underscore",
+# so Cyrillic (and other non-Latin scripts) are kept. The previous `[a-z0-9]+`
+# silently dropped every Russian token, which made the lexical half of the RRF
+# fusion a no-op for the primary language of this project.
+_TOKEN_RE = re.compile(r"[^\W_]+")
 # OpenAI-compatible /embeddings endpoints cap inputs per request; keep batches
 # well under it so the same code works for local and hosted backends.
 _EMBED_BATCH = 64

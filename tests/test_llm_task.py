@@ -103,3 +103,32 @@ class TestAnswerQuestion:
         set_llm_client(StubLLM(settings=Settings()))
         result = await answer_question("00000000-0000-0000-0000-000000000000")
         assert result["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_redelivery_of_finished_task_is_skipped(
+        self, db: Database, use_db: Database
+    ) -> None:
+        """Регресс: повторный прогон завершённой задачи не должен её перезапускать."""
+        set_llm_client(StubLLM(settings=Settings(), model="stub-task"))
+        task = await _make_task(db, question="what is two plus two")
+        await answer_question(str(task.id))
+
+        again = await answer_question(str(task.id))
+        assert again["status"] == "skipped"
+
+        reloaded = await _reload(db, task.id)
+        assert reloaded is not None
+        assert reloaded.status is TaskStatus.SUCCEEDED
+
+    @pytest.mark.asyncio
+    async def test_empty_question_dead_letters(self, db: Database, use_db: Database) -> None:
+        """Пустой вопрос не должен доходить до LLM: сразу dead-letter."""
+        set_llm_client(StubLLM(settings=Settings()))
+        task = await _make_task(db, question="   ")
+
+        result = await answer_question(str(task.id))
+        assert result["status"] == "dead_letter"
+
+        reloaded = await _reload(db, task.id)
+        assert reloaded is not None
+        assert reloaded.status is TaskStatus.DEAD_LETTER

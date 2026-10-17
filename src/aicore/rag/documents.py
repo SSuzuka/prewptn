@@ -100,7 +100,14 @@ class DocumentService:
         return result.scalar_one_or_none()
 
     async def list_documents(self, *, limit: int = 50, offset: int = 0) -> list[Document]:
-        stmt = select(Document).order_by(Document.created_at.desc()).limit(limit).offset(offset)
+        stmt = (
+            select(Document)
+            # `id` tiebreaker keeps offset pagination stable when `created_at`
+            # collides (same second on SQLite).
+            .order_by(Document.created_at.desc(), Document.id)
+            .limit(limit)
+            .offset(offset)
+        )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 

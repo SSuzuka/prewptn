@@ -18,6 +18,7 @@ from aicore.broker import broker, ensure_broker_started
 from aicore.config import get_settings
 from aicore.db.session import get_database
 from aicore.logging import get_logger
+from aicore.metrics import record_enqueue_failed
 from aicore.rag import DocumentService, EmbeddingPermanentError, chunk_text, get_retriever
 from aicore.tasks._common import load_task, mark_task_failed
 from aicore.tasks.service import TaskService
@@ -49,7 +50,9 @@ async def _run(task_id: str) -> dict[str, Any]:
         if task is None:
             return {"status": "failed", "task_id": task_id, "error": "task not found"}
 
-        await svc.mark_running(task)
+        if not await svc.mark_running(task):
+            # Документ уже индексируется другой задачей или задача завершена.
+            return {"status": "skipped", "task_id": task_id, "error": "task is not pending"}
         payload = dict(task.payload or {})
         document_id = str(payload.get("document_id") or "")
 
@@ -119,3 +122,4 @@ async def enqueue_index_document(task_id: str) -> None:
         await index_document.kiq(task_id)
     except Exception:  # noqa: BLE001 — ошибку уже зафиксировали в БД
         logger.exception("task.enqueue_failed", task_id=task_id)
+        record_enqueue_failed("index_document")

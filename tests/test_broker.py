@@ -41,24 +41,24 @@ class TestBrokerConfig:
         assert any(isinstance(m, SmartRetryMiddleware) for m in broker.middlewares)
 
     def test_retry_semantics_middleware_vs_db(self) -> None:
-        """Два счётчика ретраев: семантика разная, лимиты согласованы.
+        """Два счётчика ретраев: middleware читает `task_max_retries`, БД — нет.
 
         taskiq: `default_retry_count` = число ПОВТОРОВ, т.е. исполнений будет
-        не более `count + 1`. БД: `max_attempts` = число ИСПОЛНЕНИЙ. Оба
-        выставляются из одного `task_max_retries`, поэтому при count=3 taskiq
-        допускает 4 исполнения, а БД — 3. Источник правды — БД: задача
-        остановится по max_attempts раньше, чем middleware исчерпает свои
-        повторы. Тест фиксирует это соотношение, чтобы правка одного поля не
-        уводила лимиты молча.
+        не более `count + 1`. БД: `TaskRun.max_attempts` = число ИСПОЛНЕНИЙ,
+        задаётся при создании задачи (default=3) и НЕ выводится автоматически
+        из `task_max_retries`. Если нужен один общий knob, передавайте
+        `max_attempts` явно (например, `task_max_retries + 1`).
         """
+        from aicore.db.models import TaskRun
+
         cfg = Settings(task_max_retries=3)
         mw = build_retry_middleware(cfg)
-        db_max_attempts = cfg.task_max_retries
-
         assert mw.default_retry_count == 3
-        assert db_max_attempts == 3
-        # taskiq-предохранитель шире БД-лимита: 3 повтора = до 4 исполнений.
-        assert mw.default_retry_count + 1 >= db_max_attempts
+
+        # БД-лимит — независимый default модели, а не производная настройки.
+        column_default = TaskRun.__table__.columns["max_attempts"].default
+        assert column_default is not None
+        assert column_default.arg == 3
 
 
 @pytest.mark.integration

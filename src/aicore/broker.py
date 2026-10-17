@@ -22,6 +22,8 @@ dev-режима, а не баг.
 
 from __future__ import annotations
 
+import asyncio
+
 from taskiq import AsyncBroker, InMemoryBroker
 from taskiq.middlewares import SmartRetryMiddleware
 
@@ -39,10 +41,11 @@ def build_retry_middleware(settings: Settings | None = None) -> SmartRetryMiddle
 
     Примечание: `default_retry_count` — это число ПОВТОРОВ (taskiq semantics):
     задача исполнится не более `default_retry_count + 1` раз. В БД при этом
-    свой счётчик `TaskRun.attempts/max_attempts`. Источник правды о лимите —
-    БД (`max_attempts`); middleware-счётчик служит предохранителем на стороне
-    брокера. Оба выставляются из одного поля `task_max_retries`, чтобы не
-    расходиться, но семантика у них разная — см. тест test_retry_semantics.
+    свой независимый счётчик `TaskRun.attempts/max_attempts`: `max_attempts`
+    задаётся при создании задачи (по умолчанию 3) и НЕ выводится автоматически
+    из `task_max_retries`. Источник правды о лимите — БД (`max_attempts`);
+    middleware-счётчик служит предохранителем на стороне брокера. Нужен один
+    общий knob — задавайте `max_attempts` явно (например, `task_max_retries + 1`).
     """
     cfg = settings or get_settings()
     return SmartRetryMiddleware(
@@ -99,6 +102,7 @@ def build_broker(settings: Settings | None = None) -> AsyncBroker:
 broker = build_broker()
 
 _broker_started = False
+_broker_start_lock = asyncio.Lock()
 
 
 async def ensure_broker_started() -> None:
@@ -108,11 +112,19 @@ async def ensure_broker_started() -> None:
     would call `broker.startup()` (and its worker-startup hooks) once per task
     type. In production the worker starts the broker itself; this is for the
     API/dev path where tasks are enqueued inline.
+
+    The guard is check-then-act around an ``await``, so a lock plus a
+    double-check is required: two concurrent requests would otherwise both see
+    ``False`` and call ``startup()`` twice (duplicate worker hooks, double
+    consumer-group setup on Redis).
     """
     global _broker_started
-    if not _broker_started:
-        await broker.startup()
-        _broker_started = True
+    if _broker_started:
+        return
+    async with _broker_start_lock:
+        if not _broker_started:
+            await broker.startup()
+            _broker_started = True
 
 
 # Регистрируем задачи на этом брокере. Импорт в конце файла — иначе цикл:

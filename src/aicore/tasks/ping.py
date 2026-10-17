@@ -91,7 +91,9 @@ async def _run(task_id: str, *, fail_times: int, delay_seconds: float = 0.0) -> 
             logger.error("task.not_found", task_id=task_id)
             raise PermanentTaskError(f"task {task_id} not found")
 
-        await service.mark_running(task)
+        if not await service.mark_running(task):
+            # Повторная доставка уже обработанной/обрабатываемой задачи — не выполняем.
+            return {"status": "skipped", "task_id": task_id, "error": "task is not pending"}
 
         try:
             if task.attempts <= fail_times:

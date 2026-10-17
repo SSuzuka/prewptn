@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from aicore.api.app import create_app
-from aicore.api.deps import reset_rate_limiter
+from aicore.api.deps import RateLimiter, reset_rate_limiter
 from aicore.config import Settings, reset_settings_cache
 from aicore.db.session import Database
 from aicore.llm import reset_llm_client, set_llm_client
@@ -51,3 +53,25 @@ class TestRateLimit:
         for _ in range(5):
             resp = await client.get("/v1/tasks/00000000-0000-0000-0000-000000000000")
             assert resp.status_code == 404
+
+
+class TestLimiterMemory:
+    @pytest.mark.asyncio
+    async def test_stale_clients_are_evicted(self) -> None:
+        """Регресс: ключи клиентов не должны накапливаться бесконечно."""
+        limiter = RateLimiter(per_minute=1, window=60.0, sweep_every=1)
+        for i in range(100):
+            await limiter.allow(f"ip-{i}")
+        assert len(limiter._hits) == 100
+
+        # Прогоняем окно вперёд и делаем ещё запрос — sweep должен всё вычистить.
+        limiter._sweep(time.monotonic() + 61.0)
+        assert limiter._hits == {}
+
+    @pytest.mark.asyncio
+    async def test_key_count_is_capped(self) -> None:
+        """Жёсткий cap: число клиентов в памяти не растёт без границ."""
+        limiter = RateLimiter(per_minute=1, window=60.0, max_clients=10, sweep_every=1)
+        for i in range(50):
+            await limiter.allow(f"ip-{i}")
+        assert len(limiter._hits) <= 10

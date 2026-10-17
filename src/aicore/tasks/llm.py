@@ -19,7 +19,7 @@ from aicore.config import get_settings
 from aicore.db.session import get_database
 from aicore.llm import LLMPermanentError, LLMRequest, get_llm_client
 from aicore.logging import get_logger
-from aicore.metrics import record_rag_fallback
+from aicore.metrics import record_enqueue_failed, record_rag_fallback
 from aicore.tasks._common import load_task, mark_task_failed
 from aicore.tasks.service import TaskService
 
@@ -43,16 +43,27 @@ async def _run(task_id: str) -> dict[str, Any]:
     db = get_database()
     await db.ensure_ready()
 
-    # Фаза 1: загрузить задачу и отметить running, затем отпустить соединение.
+    # Фаза 1: загрузить задачу и атомарно заклеймить её, затем отпустить соединение.
     async with db.session() as session:
         svc = TaskService(session)
         task = await load_task(svc, task_id)
         if task is None:
             return {"status": "failed", "task_id": task_id, "error": "task not found"}
-        await svc.mark_running(task)
+        if not await svc.mark_running(task):
+            # Задачу уже обрабатывает другой воркер или она завершена: не выполняем
+            # повторно (иначе перезапишем терминальный статус и оплатим LLM дважды).
+            return {"status": "skipped", "task_id": task_id, "error": "task is not pending"}
         payload = dict(task.payload or {})
 
-    question = str(payload.get("question", ""))
+    question = str(payload.get("question", "")).strip()
+    if not question:
+        # API-слой отсекает пустой вопрос (min_length=1), но пробельная строка или
+        # прямой create_task(payload={"question": ""}) дошли бы сюда и сожгли
+        # LLM-вызов на пустом промпте. Пустой ввод неисправим ретраем.
+        # Проверка идёт ПОСЛЕ claim, поэтому неисправимый ввод стоит одной
+        # попытки (attempts=1); так же в tasks/agent_run.py — ради консистентности.
+        await mark_task_failed(task_id, "ValueError: question must not be empty", retryable=False)
+        return {"status": "dead_letter", "task_id": task_id, "error": "empty question"}
     prompt = await _with_rag(question) if payload.get("use_rag") else question
     request = LLMRequest(
         prompt=prompt,
@@ -123,3 +134,4 @@ async def enqueue_answer_question(task_id: str) -> None:
         await answer_question.kiq(task_id)
     except Exception:  # noqa: BLE001 — ошибку уже зафиксировали в БД
         logger.exception("task.enqueue_failed", task_id=task_id)
+        record_enqueue_failed("answer_question")

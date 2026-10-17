@@ -64,3 +64,12 @@ class TestLlmInstrumentation:
         assert 'aicore_llm_calls_total{backend="stub",model="metrics-model"}' in body
         assert 'aicore_llm_tokens_total{kind="prompt"}' in body
         assert 'aicore_llm_cost_usd_total{model="metrics-model"}' in body
+
+
+class TestEnqueueFailureMetric:
+    def test_records_failure_per_task_type(self) -> None:
+        from aicore.metrics import record_enqueue_failed
+
+        record_enqueue_failed("answer_question")
+        body = _exposition()
+        assert 'aicore_enqueue_failures_total{task_type="answer_question"}' in body

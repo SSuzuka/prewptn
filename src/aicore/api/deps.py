@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import defaultdict, deque
+from collections import deque
 
 from fastapi import HTTPException, Request, status
 
@@ -16,24 +16,65 @@ from aicore.config import get_settings
 
 
 class RateLimiter:
-    """Sliding-window лимитер запросов на клиента."""
+    """Sliding-window лимитер запросов на клиента.
 
-    def __init__(self, per_minute: int, window: float = 60.0) -> None:
+    The per-client deques are pruned periodically: without it the dict grows with
+    every distinct client ever seen (even after their window empties) and a bot
+    sweep turns it into an unbounded memory leak.
+    """
+
+    def __init__(
+        self,
+        per_minute: int,
+        window: float = 60.0,
+        *,
+        max_clients: int = 10_000,
+        sweep_every: int = 1_000,
+    ) -> None:
         self.per_minute = per_minute
         self.window = window
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        # `max_clients` is a safety valve, not an exact limit: under a flood of
+        # unique IPs the oldest keys (by insertion order) are evicted, which can
+        # drop a legitimate active client and hand it a false 429. That is the
+        # intended trade-off — availability over an OOM — so keep it well above
+        # the real working set, and move the counter to Redis for multi-replica.
+        self._max_clients = max_clients
+        self._sweep_every = max(1, sweep_every)
+        self._hits: dict[str, deque[float]] = {}
+        self._ops_since_sweep = 0
         self._lock = asyncio.Lock()
 
     async def allow(self, key: str) -> bool:
         now = time.monotonic()
         async with self._lock:
-            hits = self._hits[key]
+            hits = self._hits.get(key)
+            if hits is None:
+                hits = self._hits[key] = deque()
             while hits and now - hits[0] > self.window:
                 hits.popleft()
-            if len(hits) >= self.per_minute:
-                return False
-            hits.append(now)
-            return True
+            allowed = len(hits) < self.per_minute
+            if allowed:
+                hits.append(now)
+
+            self._ops_since_sweep += 1
+            if self._ops_since_sweep >= self._sweep_every:
+                self._ops_since_sweep = 0
+                self._sweep(now)
+            return allowed
+
+    def _sweep(self, now: float) -> None:
+        """Drop clients whose window is empty, then cap the total key count."""
+        stale = [
+            key for key, hits in self._hits.items() if not hits or now - hits[-1] > self.window
+        ]
+        for key in stale:
+            del self._hits[key]
+
+        overflow = len(self._hits) - self._max_clients
+        if overflow > 0:
+            # dict preserves insertion order: drop the oldest keys first.
+            for key in list(self._hits)[:overflow]:
+                del self._hits[key]
 
 
 _limiter: RateLimiter | None = None

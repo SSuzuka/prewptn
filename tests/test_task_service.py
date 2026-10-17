@@ -271,3 +271,34 @@ class TestDocumentModel:
             # После ошибки flush сессия в состоянии PendingRollback —
             # нужен явный rollback, иначе упадёт commit() в контекстном менеджере.
             await session.rollback()
+
+
+class TestAtomicClaim:
+    @pytest.mark.asyncio
+    async def test_second_claim_loses(self, db: Database) -> None:
+        """Атомарный claim: повторная доставка не захватывает ту же задачу."""
+        async with db.session() as session:
+            svc = TaskService(session)
+            task, _ = await svc.create_task(task_type="ping", payload={})
+
+            assert await svc.mark_running(task) is True
+            assert task.status is TaskStatus.RUNNING
+            assert task.attempts == 1
+
+            # Второй воркер (или redelivery) обязан проиграть claim.
+            assert await svc.mark_running(task) is False
+            assert task.attempts == 1
+            assert task.status is TaskStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_is_not_reclaimed(self, db: Database) -> None:
+        """Регресс: переотдача завершённой задачи не затирает SUCCEEDED."""
+        async with db.session() as session:
+            svc = TaskService(session)
+            task, _ = await svc.create_task(task_type="ping", payload={})
+            assert await svc.mark_running(task) is True
+            await svc.mark_succeeded(task, result={"ok": True})
+
+            assert await svc.mark_running(task) is False
+            assert task.status is TaskStatus.SUCCEEDED
+            assert task.attempts == 1
