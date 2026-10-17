@@ -77,3 +77,11 @@ def reset_llm_client() -> None:
     """Drop the singleton (tests)."""
     global _client
     _client = None
+
+
+async def close_llm_client() -> None:
+    """Закрыть LLM-клиент (httpx-пулы) при остановке приложения, если он создан."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None

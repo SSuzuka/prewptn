@@ -20,7 +20,7 @@ from aicore.db.session import get_database
 from aicore.logging import get_logger
 from aicore.metrics import record_enqueue_failed
 from aicore.rag import DocumentService, EmbeddingPermanentError, chunk_text, get_retriever
-from aicore.tasks._common import load_task, mark_task_failed
+from aicore.tasks._common import load_task, mark_task_enqueue_failed, mark_task_failed
 from aicore.tasks.service import TaskService
 
 logger = get_logger(__name__)
@@ -116,10 +116,15 @@ async def _mark_document_failed(document_id: str, error: str) -> None:
 
 
 async def enqueue_index_document(task_id: str) -> None:
-    """Поставить задачу индексации в брокер."""
-    await ensure_broker_started()
+    """Поставить задачу индексации в брокер.
+
+    `ensure_broker_started` внутри try: недоступный брокер не должен оставлять
+    задачу в PENDING навсегда.
+    """
     try:
+        await ensure_broker_started()
         await index_document.kiq(task_id)
-    except Exception:  # noqa: BLE001 — ошибку уже зафиксировали в БД
+    except Exception as exc:  # noqa: BLE001 — фиксируем в БД, а не только в логе
         logger.exception("task.enqueue_failed", task_id=task_id)
         record_enqueue_failed("index_document")
+        await mark_task_enqueue_failed(task_id, f"{type(exc).__name__}: {exc}")

@@ -3,7 +3,7 @@ name = "aicore"
 version = "0.1.0"
 description = "Backend for an AI/Agent platform: async task pipeline, LangGraph agents, RAG, MCP, observability"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 
 # Версии заданы диапазонами по стабильным API-линиям; точные версии фиксируются в uv.lock.
@@ -27,6 +27,7 @@ dependencies = [
     "structlog>=24,<27",
     "prometheus-client>=0.20,<1",
     "opentelemetry-sdk>=1.27,<2",
+    "alembic>=1.13,<2",
 ]
 
 [project.optional-dependencies]

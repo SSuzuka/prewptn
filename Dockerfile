@@ -7,7 +7,7 @@
 # OpenAI-compatible API and local (fastembed/ONNX) embeddings for RAG.
 FROM python:3.12-slim AS base
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
 
 # onnxruntime (pulled in by fastembed) links libgomp at runtime, which the slim
 # base image does not ship. Without it EMBEDDING_BACKEND=local fails on import.

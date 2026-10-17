@@ -13,10 +13,10 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BrokerBackend = Literal["memory", "redis"]
 VectorBackend = Literal["memory", "qdrant"]
@@ -152,7 +152,18 @@ class Settings(BaseSettings):
     api_host: str = Field(default="127.0.0.1")
     api_port: int = Field(default=8000, ge=1, le=65535)
     api_rate_limit_per_minute: int = Field(default=60, ge=1)
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # Разрешённые X-API-Key; пусто = аутентификация выключена (dev/MVP).
+    # Список через запятую. Закрытый режим включается одной переменной, без
+    # правки кода; дефолт оставляет проект открытым для локального запуска.
+    # NoDecode: без него pydantic-settings парсит list из env как JSON и падает
+    # на "key1,key2" до того, как отработает наш split-валидатор.
+    api_keys: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Доверять ли X-Forwarded-For при определении клиента. Включать только за
+    # доверенным прокси/ingress: иначе заголовок подделываем и лимит обходится.
+    trust_proxy_headers: bool = Field(default=False)
+    cors_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:3000"]
+    )
 
     # --------------------------------------------------- наблюдаемость
     log_level: str = Field(default="INFO")
@@ -173,6 +184,14 @@ class Settings(BaseSettings):
     @classmethod
     def _split_cors(cls, value: object) -> object:
         """Принимает как список, так и строку через запятую."""
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("api_keys", mode="before")
+    @classmethod
+    def _split_api_keys(cls, value: object) -> object:
+        """Принимает как список, так и строку ключей через запятую."""
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value

@@ -49,10 +49,14 @@ class TestRateLimit:
         assert third.headers.get("retry-after") == "60"
 
     @pytest.mark.asyncio
-    async def test_read_endpoint_is_not_rate_limited(self, client: AsyncClient) -> None:
+    async def test_read_endpoint_is_rate_limited(self, client: AsyncClient) -> None:
+        """GET-эндпоинты тоже под лимитом: раньше были открыты и это DoS-вектор."""
+        statuses = []
         for _ in range(5):
             resp = await client.get("/v1/tasks/00000000-0000-0000-0000-000000000000")
-            assert resp.status_code == 404
+            statuses.append(resp.status_code)
+        assert 429 in statuses
+        assert statuses.count(404) <= 2
 
 
 class TestLimiterMemory:

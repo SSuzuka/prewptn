@@ -111,3 +111,11 @@ def set_retriever(retriever: Retriever) -> None:
 def reset_retriever() -> None:
     global _retriever
     _retriever = None
+
+
+async def close_retriever() -> None:
+    """Закрыть retriever (эмбеддер + Qdrant-клиент) при остановке приложения."""
+    global _retriever
+    if _retriever is not None:
+        await _retriever.aclose()
+        _retriever = None

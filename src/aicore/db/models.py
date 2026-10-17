@@ -210,11 +210,10 @@ class IdempotencyKey(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # и FK ушёл бы в БД как NULL — тогда CASCADE не на что вешать.
     task: Mapped[TaskRun | None] = relationship("TaskRun", foreign_keys=[task_id])
 
-    # Снимок ответа, отданного клиенту (чтобы повтор вернул ровно тот же ответ).
-    response_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON().with_variant(JSONB, "postgresql"),
-        nullable=True,
-    )
+    # SHA-256 канонического JSON тела запроса. Повтор с тем же ключом, но
+    # ДРУГИМ телом — это конфликт (409), а не молчаливый возврат старого ответа:
+    # иначе клиент, отправив ключ с новым вопросом, получил бы чужой результат.
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (UniqueConstraint("key", "scope", name="uq_idempotency_keys_key_scope"),)
 

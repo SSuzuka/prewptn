@@ -68,7 +68,11 @@ async def create_document(body: DocumentCreateRequest, session: SessionDep) -> D
     return DocumentView.from_document(document)
 
 
-@router.get("/documents", summary="Список документов RAG")
+@router.get(
+    "/documents",
+    dependencies=[Depends(rate_limit)],
+    summary="Список документов RAG",
+)
 async def list_documents(
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -78,7 +82,11 @@ async def list_documents(
     return [DocumentView.from_document(document) for document in documents]
 
 
-@router.get("/documents/{document_id}", summary="Статус индексации документа")
+@router.get(
+    "/documents/{document_id}",
+    dependencies=[Depends(rate_limit)],
+    summary="Статус индексации документа",
+)
 async def get_document(document_id: str, session: SessionDep) -> DocumentView:
     _require_uuid(document_id)
     document = await DocumentService(session).get_document(document_id)

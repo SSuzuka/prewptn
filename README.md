@@ -51,7 +51,7 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 251 тест
+uv run pytest                        # 275 тестов
 uv run ruff check src tests scripts  # линтер
 uv run ruff format --check src tests scripts
 uv run python scripts/demo.py            # конфиг, логи, health-check
@@ -79,7 +79,7 @@ Swagger UI после старта сервера: <http://127.0.0.1:8000/docs> 
 
 | Инструмент | Версия | Зачем | Обязателен? |
 |---|---|---|---|
-| Python | 3.11 / 3.12 | рантайм | ✅ да |
+| Python | 3.11 – 3.13 | рантайм | ✅ да |
 | uv | ≥0.5 | venv, зависимости, запуск | ✅ да |
 | git | любая | версионирование | ✅ да |
 | Docker Desktop | — | Postgres/Redis/Qdrant для prod-режима | ❌ нет |
@@ -189,6 +189,12 @@ RAG (этап 4) реализован как отдельная подсисте
 | `GET` | `/v1/documents` | список документов RAG | ✅ |
 | `GET` | `/v1/documents/{id}` | статус индексации документа | ✅ |
 | `POST` | `/v1/agents` | запуск агента (supervisor + subagents, RAG как tool), идемпотентно | ✅ |
+
+Все `/v1`-эндпоинты и `/metrics` под rate limit; если задан `api_keys`,
+они требуют заголовок `X-API-Key` (иначе 401). `/health`, `/ready`, `/version`
+остаются открытыми для проб оркестратора. Каждый ответ несёт заголовок
+`X-Correlation-ID` (принятый из запроса или сгенерированный) — тот же id идёт
+во все логи запроса.
 
 **Целевой API (этап 6):**
 
@@ -302,6 +308,8 @@ agent_max_threads:    int   = 256       # предел веток (thread_id) в
 api_host:  str = "127.0.0.1"
 api_port:  int = 8000
 api_rate_limit_per_minute: int = 60
+api_keys: list[str] = []                                # пусто = auth выключен; иначе X-API-Key
+trust_proxy_headers: bool = False                       # брать IP из X-Forwarded-For (за прокси)
 cors_origins: list[str] = ["http://localhost:3000"]   # или строка через запятую
 
 # --- секреты (только из окружения, в коде не хардкодятся) ---
@@ -398,7 +406,7 @@ uv sync --extra embeddings # fastembed (ONNX): бесплатные локаль
 
 | Job | Триггер | Что делает |
 |---|---|---|
-| `test` | push, PR | `ruff check`, `ruff format --check`, `pytest` на Python 3.11 и 3.12 (офлайн) |
+| `test` | push, PR | `ruff check`, `ruff format --check`, `pytest` на Python 3.11, 3.12 и 3.13 (офлайн) |
 | `docker` | push, PR | сборка `Dockerfile` без пуша — ловит ошибки образа на PR |
 | `publish` | push в `main`/теги, `needs: [test, docker]` | собирает и пушит образ в GHCR |
 
@@ -442,6 +450,19 @@ use_jitter=True, use_delay_exponent=True, max_delay_exponent=60)`. Jitter
 **Idempotency через `Idempotency-Key` + unique-constraint.** Повторный
 `POST /v1/tasks` с тем же ключом возвращает существующую задачу. Без этого
 дубль от ретрая на стороне клиента означает двойную оплату LLM-вызовов.
+
+**Повтор ключа с другим телом — это 409, а не молчаливый старый ответ.**
+Вместе с ключом хранится SHA-256 канонического тела запроса
+(`IdempotencyKey.request_fingerprint`). Тот же ключ с другим вопросом — не
+идемпотентный повтор, а конфликт: по семантике Stripe клиент получает 409,
+иначе он бы получил результат не на свой вопрос.
+
+**Ошибка постановки в очередь не оставляет задачу в `pending`.** Если
+брокер/транспорт недоступен (Redis лёг), `enqueue_*` ловит исключение и
+переводит задачу в `failed` условным `UPDATE ... WHERE status='pending'`
+(задачу, которую уже взял воркер, не трогает). Раньше задача зависала в
+`pending` навсегда: `/retry` отдавал 409, а повтор POST возвращал ту же
+зависшую задачу.
 
 **Dead-letter queue.** Задача, исчерпавшая `max_retries`, не пропадает:
 статус `dead_letter` + ручной `POST /v1/tasks/{id}/retry`. Ошибка при этом
@@ -496,6 +517,12 @@ prompt_per_1k, completion_per_1k)` — единственная точка ра�
 отправляет постоянную ошибку (например, 4xx от LLM) сразу в `DEAD_LETTER`, даже
 если попытки остались. Без этого флага постоянная ошибка на первой попытке
 вернула бы задачу в `PENDING` навсегда.
+
+**Схема в проде создаётся Alembic, не `create_all()`.** `create_all()` из
+нескольких процессов (`uvicorn --workers 4` + воркер) гоняется за созданием
+таблиц и enum-типов, а миграций для эволюции схемы он не даёт. Поэтому
+авто-создание оставлено только для SQLite (dev/тесты), а в проде схему
+накатывает `uv run alembic upgrade head` (DSN берётся из тех же настроек).
 
 **Все DateTime-колонки timezone-aware.** `utcnow()` возвращает aware-datetime,
 поэтому каждая колонка объявлена `DateTime(timezone=True)`. На Postgres колонка
@@ -602,6 +629,14 @@ LangChain `BaseChatModel`; чтобы граф (модель → tools → мо�
 асинхронный), а sync-путь LangGraph падает на асинхронных `StructuredTool`.
 Поэтому все tools объявлены `async`.
 
+**CORS, correlation_id и rate limit — на краю API.** CORS-мидлварь включена
+по `cors_origins` (иначе браузер не пройдёт preflight). `correlation_id`
+ставится чистым ASGI-мидлварем (не `BaseHTTPMiddleware` — тот ломает SSE):
+берётся из `X-Correlation-ID`/`X-Request-ID` или генерируется и возвращается
+в заголовке. Rate limit стоит на всех `/v1`-эндпоинтах, включая чтение и SSE;
+за доверенным прокси (`trust_proxy_headers=true`) клиент берётся из
+`X-Forwarded-For`.
+
 ---
 
 ## Технологический стек
@@ -611,7 +646,7 @@ LangChain `BaseChatModel`; чтобы граф (модель → tools → мо�
 
 | Слой | Технология | Диапазон |
 |---|---|---|
-| Runtime | Python | 3.11 – 3.12 |
+| Runtime | Python | 3.11 – 3.13 |
 | API | FastAPI · uvicorn · pydantic · pydantic-settings | `>=0.142,<0.143` · `>=0.30,<0.55` · `>=2.9,<3` · `>=2.5,<3` |
 | Очередь | taskiq · taskiq-redis *(extra)* | `>=0.13,<0.14` · `>=1.2,<2` |
 | БД | SQLAlchemy · aiosqlite · asyncpg *(extra)* | `>=2.0,<2.1` · `>=0.20,<0.23` · `>=0.30,<0.33` |
@@ -643,6 +678,8 @@ uop/
 ├── .env.example                     ✅ все переключатели с комментариями
 ├── .gitignore                       ✅
 ├── docker-compose.yml               ✅ лежит, но в MVP не запускается (см. комментарий в файле)
+├── alembic.ini                      ✅ конфиг миграций (DSN берётся из настроек)
+├── migrations/                      ✅ Alembic: env.py (async) + versions/
 ├── Dockerfile                       ✅ образ API+воркер (сборка в GHCR)
 ├── .dockerignore                    ✅
 ├── .github/workflows/               ✅ ci.yml: test → docker build → publish (GHCR)
@@ -676,7 +713,7 @@ uop/
 │   │   ├── __init__.py              ✅
 │   │   ├── base.py                  ✅ Base, naming_convention, url_is_sqlite
 │   │   ├── models.py                ✅ TaskRun, Document, IdempotencyKey
-│   │   └── session.py               ✅ async-движок, сессии, create_all, PRAGMA FK
+│   │   └── session.py               ✅ async-движок, сессии, create_all (dev), PRAGMA FK
 │   ├── tasks/                       ✅ этап 2
 │   │   ├── __init__.py              ✅
 │   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ
@@ -770,7 +807,6 @@ uop/
 - RAG: нативные sparse-векторы/BM25 внутри Qdrant (Query API + fusion) вместо
   лексического RRF; опциональный кросс-энкодер-реранкер (по замеру, не по умолчанию).
 - RAG: загрузка из URL/файлов, `DELETE /v1/documents/{id}` и явный reindex.
-- Alembic-миграции вместо `create_all()`.
 - Postgres-checkpointer для графа агента (в MVP — `InMemorySaver`).
 - Kafka-брокер (`taskiq-aio-kafka`) как альтернатива Redis Streams.
 - WebSocket как второй транспорт стриминга рядом с SSE.
@@ -781,4 +817,4 @@ uop/
 
 ## Лицензия
 
-MIT
+MIT — см. [LICENSE](LICENSE).

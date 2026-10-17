@@ -1,8 +1,10 @@
 """Управление async-сессиями SQLAlchemy и создание схемы.
 
 На dev/test используется `sqlite+aiosqlite`, в проде — `postgresql+asyncpg`
-(extra `postgres`). Схема создаётся через `create_all()` (вместо Alembic,
-который относится к фазе 2).
+(extra `postgres`). На SQLite схема создаётся через `create_all()` для
+удобства dev/тестов; в проде (Postgres) схему создаёт **Alembic**
+(`uv run alembic upgrade head`): `create_all()` из нескольких процессов
+гоняется за таблицами и enum-типами, а эволюция схемы без миграций невозможна.
 """
 
 from __future__ import annotations
@@ -129,10 +131,15 @@ class Database:
         Вызывается из API-зависимости и воркером, чтобы не требовать отдельного
         startup-хука. Уже подключённая БД остаётся как есть (тесты подменяют
         синглтон на готовую in-memory базу).
+
+        Авто-создание схемы — только для SQLite (dev/test). В проде на Postgres
+        это делает Alembic: `create_all()` из нескольких воркеров/процессов
+        гоняется за созданием таблиц и enum-типов.
         """
         if self._engine is None:
             await self.connect()
-            await self.create_all()
+            if url_is_sqlite(self.settings.db_url):
+                await self.create_all()
 
     async def drop_all(self) -> None:
         """Удалить все таблицы — только для тестов."""

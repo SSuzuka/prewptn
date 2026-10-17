@@ -127,6 +127,21 @@ async def ensure_broker_started() -> None:
             _broker_started = True
 
 
+async def shutdown_broker() -> None:
+    """Закрыть брокер, если он был запущен в этом процессе.
+
+    Без этого при остановке приложения остаются висеть consumer-группы и
+    соединение с Redis. Guard по `_broker_started`: брокер стартует лениво на
+    первом enqueue, и `shutdown()` на незапущенном брокере не нужен.
+    """
+    global _broker_started
+    if not _broker_started:
+        return
+    await broker.shutdown()
+    _broker_started = False
+    logger.info("broker.shutdown")
+
+
 # Регистрируем задачи на этом брокере. Импорт в конце файла — иначе цикл:
 # модули задач импортируют `broker` из этого модуля. Без этого воркер
 # (`taskiq worker aicore.broker:broker`) не знал бы ни одной задачи.

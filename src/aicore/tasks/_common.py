@@ -40,3 +40,20 @@ async def mark_task_failed(task_id: str, error: str, *, retryable: bool) -> None
                 await svc.mark_failed(task, error, retryable=retryable)
     except Exception:  # noqa: BLE001 — не маскируем исходную ошибку
         logger.exception("task.mark_failed_failed", task_id=task_id)
+
+
+async def mark_task_enqueue_failed(task_id: str, error: str) -> None:
+    """Mark a task stuck in PENDING as FAILED after a queue/transport failure.
+
+    Runs in its own short session so a broken enqueue call cannot leave the
+    task hanging forever with no path to `/retry`.
+    """
+    db = get_database()
+    try:
+        async with db.session() as session:
+            svc = TaskService(session)
+            task = await load_task(svc, task_id)
+            if task is not None:
+                await svc.mark_enqueue_failed(task, error)
+    except Exception:  # noqa: BLE001 — не маскируем исходную ошибку
+        logger.exception("task.mark_enqueue_failed_failed", task_id=task_id)

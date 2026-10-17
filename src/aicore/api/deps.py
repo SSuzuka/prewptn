@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from collections import deque
 
@@ -94,12 +95,48 @@ def reset_rate_limiter() -> None:
 
 
 async def rate_limit(request: Request) -> None:
-    """Зависимость: 429, если клиент превысил лимит запросов в минуту."""
+    """Зависимость: 429, если клиент превысил лимит запросов в минуту.
+
+    Клиент определяется по IP. За доверенным прокси (proxy_headers) берётся
+    первый адрес из `X-Forwarded-For` — иначе все клиенты за одним прокси
+    делили бы один счётчик, а лимит вырождался бы.
+    """
     limiter = get_rate_limiter()
-    client = request.client.host if request.client else "anonymous"
+    client = _client_key(request)
     if not await limiter.allow(client):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="rate limit exceeded",
             headers={"Retry-After": str(int(limiter.window))},
+        )
+
+
+def _client_key(request: Request) -> str:
+    """Ключ клиента для лимитера: IP, с учётом доверенного прокси."""
+    if get_settings().trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",", 1)[0].strip()
+            if first:
+                return first
+    return request.client.host if request.client else "anonymous"
+
+
+async def require_api_key(request: Request) -> None:
+    """401, если включена аутентификация по ключу, а ключ не подошёл.
+
+    Пустой список `api_keys` = аутентификация выключена: проект остаётся
+    открытым для локального запуска (как и остальные in-memory дефолты), но
+    закрытый режим включается одной переменной окружения. Сравнение —
+    constant-time, чтобы не течь по таймингу.
+    """
+    keys = get_settings().api_keys
+    if not keys:
+        return
+    presented = request.headers.get("x-api-key")
+    if presented is None or not any(secrets.compare_digest(presented, key) for key in keys):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid or missing API key",
+            headers={"WWW-Authenticate": "ApiKey"},
         )

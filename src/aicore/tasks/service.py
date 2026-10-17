@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -22,9 +24,30 @@ from aicore.metrics import record_task_latency, record_task_status
 logger = get_logger(__name__)
 
 
+class IdempotencyConflictError(ValueError):
+    """Тот же Idempotency-Key использован с другим телом запроса.
+
+    По семантике идемпотентности (Stripe и др.) это конфликт: ключ уже связан
+    с конкретным запросом, и молча отдать ответ на старое тело нельзя — клиент
+    получил бы результат не на свой вопрос.
+    """
+
+
 def utcnow() -> datetime:
     """Timezone-aware текущее время."""
     return datetime.now(UTC)
+
+
+def fingerprint_payload(payload: dict[str, Any]) -> str:
+    """Канонический SHA-256 тела запроса, независимый от порядка ключей."""
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class TaskService:
@@ -43,6 +66,7 @@ class TaskService:
         idempotency_scope: str = "default",
         max_attempts: int = 3,
         broker_task_id: str | None = None,
+        request_fingerprint: str | None = None,
     ) -> tuple[TaskRun, bool]:
         """Создать задачу. Возвращает `(task, created)`.
 
@@ -50,20 +74,31 @@ class TaskService:
         возвращается существующая задача и `created=False` — дубль не создаётся
         и токены не жгутся повторно.
 
+        Повтор с тем же ключом, но ДРУГИМ телом запроса — не идемпотентный
+        повтор, а конфликт: поднимается `IdempotencyConflictError` (API отдаёт
+        409). Иначе клиент молча получил бы ответ на старый вопрос.
+
         Гонки решаются unique-constraint'ом: при параллельном создании одного
         ключа второй INSERT падает с IntegrityError, и мы перечитываем задачу.
         """
         if idempotency_key:
-            existing = await self.get_task_by_idempotency_key(
-                idempotency_key, scope=idempotency_scope
-            )
-            if existing is not None:
-                logger.info(
-                    "task.idempotent_replay",
-                    task_id=str(existing.id),
-                    idempotency_key=idempotency_key,
+            if request_fingerprint is None:
+                request_fingerprint = fingerprint_payload(payload)
+            existing_key = await self._get_idempotency_key(idempotency_key, idempotency_scope)
+            if existing_key is not None:
+                self._verify_fingerprint(existing_key, request_fingerprint)
+                existing = (
+                    await self.get_task(existing_key.task_id)
+                    if existing_key.task_id is not None
+                    else None
                 )
-                return existing, False
+                if existing is not None:
+                    logger.info(
+                        "task.idempotent_replay",
+                        task_id=str(existing.id),
+                        idempotency_key=idempotency_key,
+                    )
+                    return existing, False
 
         task = TaskRun(
             task_type=task_type,
@@ -89,13 +124,25 @@ class TaskService:
                     # ушёл бы в БД с task_id=NULL — тогда ON DELETE CASCADE не на что
                     # вешать. Связь через relationship проставляет FK корректно.
                     self.session.add(
-                        IdempotencyKey(key=idempotency_key, scope=idempotency_scope, task=task)
+                        IdempotencyKey(
+                            key=idempotency_key,
+                            scope=idempotency_scope,
+                            task=task,
+                            request_fingerprint=request_fingerprint,
+                        )
                     )
                 await self.session.flush()
         except IntegrityError:
-            # Параллельный запрос успел раньше — отдаём его задачу.
-            existing = await self.get_task_by_idempotency_key(
-                idempotency_key, scope=idempotency_scope
+            # Параллельный запрос успел раньше — отдаём его задачу, но только
+            # если тело совпадает: иначе это конфликт ключа, а не повтор.
+            existing_key = await self._get_idempotency_key(idempotency_key, idempotency_scope)
+            if existing_key is None:
+                raise
+            self._verify_fingerprint(existing_key, request_fingerprint)
+            existing = (
+                await self.get_task(existing_key.task_id)
+                if existing_key.task_id is not None
+                else None
             )
             if existing is None:
                 raise
@@ -104,6 +151,30 @@ class TaskService:
 
         logger.info("task.created", task_id=str(task.id), task_type=task_type)
         return task, True
+
+    async def _get_idempotency_key(self, key: str, scope: str) -> IdempotencyKey | None:
+        """Найти строку ключа идемпотентности по паре (key, scope)."""
+        result = await self.session.execute(
+            select(IdempotencyKey).where(IdempotencyKey.key == key, IdempotencyKey.scope == scope)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def _verify_fingerprint(existing: IdempotencyKey, incoming: str | None) -> None:
+        """409-конфликт, если тело запроса у повтора отличается.
+
+        `request_fingerprint` может быть NULL у записей, созданных до появления
+        колонки, — такие пропускаем, чтобы не ломать старые ключи.
+        """
+        if existing.request_fingerprint and incoming and existing.request_fingerprint != incoming:
+            logger.warning(
+                "task.idempotency_conflict",
+                idempotency_key=existing.key,
+                scope=existing.scope,
+            )
+            raise IdempotencyConflictError(
+                "Idempotency-Key already used with a different request body"
+            )
 
     # ---------------------------------------------------------------- чтение
     async def get_task(self, task_id: UUID | str) -> TaskRun | None:
@@ -279,6 +350,28 @@ class TaskService:
         await self.session.flush()
         record_task_status(task.task_type, task.status.value)
         logger.info("task.cancelled", task_id=str(task.id))
+        return task
+
+    async def mark_enqueue_failed(self, task: TaskRun, error: str) -> TaskRun:
+        """Задача не попала в очередь — перевести её из PENDING в FAILED.
+
+        `enqueue_*` ловит ошибку брокера/транспорта (например, Redis недоступен).
+        Раньше задача оставалась в PENDING навсегда: ручной /retry отдавал 409,
+        потому что перезапускаемы только FAILED и DEAD_LETTER. Здесь переводим
+        её в FAILED, но только если её ещё НИКТО не заклеймил — условный
+        `UPDATE ... WHERE status='pending'`, чтобы не перетереть статус задачи,
+        которую параллельно успел взять воркер.
+        """
+        result = await self.session.execute(
+            update(TaskRun)
+            .where(TaskRun.id == task.id, TaskRun.status == TaskStatus.PENDING)
+            .values(status=TaskStatus.FAILED, error=error, finished_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.refresh(task)
+        if result.rowcount == 1:
+            record_task_status(task.task_type, task.status.value)
+            logger.error("task.enqueue_failed", task_id=str(task.id), error=error)
         return task
 
     async def reset_for_retry(self, task: TaskRun) -> TaskRun:

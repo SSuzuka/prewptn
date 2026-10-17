@@ -20,7 +20,7 @@ from aicore.db.session import get_database
 from aicore.llm import LLMPermanentError, LLMRequest, get_llm_client
 from aicore.logging import get_logger
 from aicore.metrics import record_enqueue_failed, record_rag_fallback
-from aicore.tasks._common import load_task, mark_task_failed
+from aicore.tasks._common import load_task, mark_task_enqueue_failed, mark_task_failed
 from aicore.tasks.service import TaskService
 
 logger = get_logger(__name__)
@@ -128,10 +128,15 @@ async def enqueue_answer_question(task_id: str) -> None:
 
     На InMemoryBroker (dev) задача исполняется прямо здесь; на
     RedisStreamBroker (prod) вызов только кладёт её в очередь и возвращается.
+
+    `ensure_broker_started` внутри try: если Redis/сеть недоступны, startup
+    падает так же, как и `kiq`, и задача должна быть помечена FAILED, а не
+    остаться в PENDING навсегда.
     """
-    await ensure_broker_started()
     try:
+        await ensure_broker_started()
         await answer_question.kiq(task_id)
-    except Exception:  # noqa: BLE001 — ошибку уже зафиксировали в БД
+    except Exception as exc:  # noqa: BLE001 — фиксируем в БД, а не только в логе
         logger.exception("task.enqueue_failed", task_id=task_id)
         record_enqueue_failed("answer_question")
+        await mark_task_enqueue_failed(task_id, f"{type(exc).__name__}: {exc}")

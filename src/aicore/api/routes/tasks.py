@@ -18,7 +18,7 @@ from aicore.streaming.events import stream_task_events
 from aicore.tasks.agent_run import enqueue_run_agent
 from aicore.tasks.llm import enqueue_answer_question
 from aicore.tasks.rag_index import enqueue_index_document
-from aicore.tasks.service import TaskService
+from aicore.tasks.service import IdempotencyConflictError, TaskService
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -54,14 +54,17 @@ async def create_task(
     idempotency_key: IdempotencyKey = None,
 ) -> TaskView:
     svc = TaskService(session)
-    task, created = await svc.create_task(
-        task_type="answer_question",
-        payload=body.model_dump(exclude_none=True),
-        idempotency_key=idempotency_key,
-        # Отдельный скоуп на эндпоинт: иначе один и тот же `Idempotency-Key`,
-        # отправленный на /v1/tasks и /v1/agents, вернул бы задачу чужого типа.
-        idempotency_scope="tasks",
-    )
+    try:
+        task, created = await svc.create_task(
+            task_type="answer_question",
+            payload=body.model_dump(exclude_none=True),
+            idempotency_key=idempotency_key,
+            # Отдельный скоуп на эндпоинт: иначе один и тот же `Idempotency-Key`,
+            # отправленный на /v1/tasks и /v1/agents, вернул бы задачу чужого типа.
+            idempotency_scope="tasks",
+        )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if created:
         # Коммитим ДО постановки в очередь: задача читает себя отдельной сессией
         # и должна быть уже видна.
@@ -73,7 +76,11 @@ async def create_task(
     return TaskView.from_task(task)
 
 
-@router.get("/tasks/{task_id}", summary="Статус задачи с метриками")
+@router.get(
+    "/tasks/{task_id}",
+    dependencies=[Depends(rate_limit)],
+    summary="Статус задачи с метриками",
+)
 async def get_task(task_id: str, session: SessionDep) -> TaskView:
     _require_uuid(task_id)
     task = await TaskService(session).get_task(task_id)
@@ -105,7 +112,11 @@ async def retry_task(task_id: str, session: SessionDep) -> TaskView:
     return TaskView.from_task(task)
 
 
-@router.get("/tasks/{task_id}/stream", summary="SSE-поток событий выполнения")
+@router.get(
+    "/tasks/{task_id}/stream",
+    dependencies=[Depends(rate_limit)],
+    summary="SSE-поток событий выполнения",
+)
 async def stream_task(task_id: str) -> EventSourceResponse:
     _require_uuid(task_id)
     return EventSourceResponse(stream_task_events(task_id))
