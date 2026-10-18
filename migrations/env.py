@@ -18,14 +18,16 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from aicore.config import get_settings
 from aicore.db import models  # noqa: F401 — регистрирует таблицы в Base.metadata
 from aicore.db.base import Base
+from aicore.db.dsn import escape_percent
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Единственный источник правды по DSN — настройки приложения.
-config.set_main_option("sqlalchemy.url", get_settings().db_url)
+# Единственный источник правды по DSN — настройки приложения. `%` экранируется:
+# иначе пароль со спецсимволами (`p%40ss`) роняет Alembic на интерполяции.
+config.set_main_option("sqlalchemy.url", escape_percent(get_settings().db_url))
 
 target_metadata = Base.metadata
 

@@ -29,10 +29,14 @@ from aicore.rag.base import (
 )
 from aicore.telemetry import span
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def _tokens(text: str) -> list[str]:
+    # `\w+` (unicode) captures Cyrillic and other scripts too. The old
+    # `[a-z0-9]+` collapsed every Russian chunk to an empty token list — and
+    # thus to the same vector — which silently broke retrieval in dev/tests on
+    # non-Latin text.
     return _TOKEN_RE.findall(text.lower())
 
 

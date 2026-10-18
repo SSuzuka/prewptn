@@ -49,13 +49,15 @@ async def create_document(body: DocumentCreateRequest, session: SessionDep) -> D
     # Идемпотентный повтор не должен навсегда «запирать» упавший документ:
     # повторная загрузка того же текста после failed ставит новую задачу.
     if created or document.status == DocumentStatus.FAILED:
+        # Текст документа НЕ кладём в payload: его читает индексер из строки
+        # документа (`Document.content`). Иначе до 1 МБ ехало бы в Redis и в
+        # JSONB `task_runs.payload` на каждый документ.
         task, _ = await TaskService(session).create_task(
             task_type="index_document",
             payload={
                 "document_id": str(document.id),
                 "title": document.title,
                 "source": document.source,
-                "content": body.content,
             },
         )
         # Коммитим ДО постановки в очередь: задача читает документ отдельной

@@ -9,14 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aicore.config import get_settings
 from aicore.db.models import IdempotencyKey, TaskRun, TaskStatus
 from aicore.logging import get_logger
 from aicore.metrics import record_task_latency, record_task_status
@@ -135,6 +136,10 @@ class TaskService:
         except IntegrityError:
             # Параллельный запрос успел раньше — отдаём его задачу, но только
             # если тело совпадает: иначе это конфликт ключа, а не повтор.
+            if idempotency_key is None:
+                # IntegrityError без ключа идемпотентности — не наш race
+                # (например, другой unique-constraint): не глотаем его.
+                raise
             existing_key = await self._get_idempotency_key(idempotency_key, idempotency_scope)
             if existing_key is None:
                 raise
@@ -229,22 +234,51 @@ class TaskService:
         return await self.list_tasks(status=TaskStatus.DEAD_LETTER, limit=limit)
 
     # ------------------------------------------------------------ переходы
-    async def mark_running(self, task: TaskRun) -> bool:
-        """Atomically claim a PENDING task for execution.
+    async def mark_running(self, task: TaskRun, *, lease_seconds: float | None = None) -> bool:
+        """Atomically claim a PENDING task (or a RUNNING one with an expired lease).
 
-        The transition is a single conditional ``UPDATE ... WHERE status='pending'``
-        so that under at-least-once delivery (taskiq redelivery, several workers)
-        exactly one caller wins and the rest see ``rowcount == 0``. Without this,
-        a redelivered message could re-run — and overwrite — a task that already
+        The transition is a single conditional ``UPDATE`` so that under
+        at-least-once delivery (taskiq redelivery, several workers) exactly one
+        caller wins and the rest see ``rowcount == 0``. Without this, a
+        redelivered message could re-run — and overwrite — a task that already
         reached a terminal status, double-charging the LLM/embeddings.
 
+        A RUNNING task is re-claimable only once its *lease* expired, i.e. its
+        ``started_at`` is older than ``now - lease_seconds``. This is what keeps
+        the two failure modes apart:
+
+        * a worker crashed mid-task and the message was redelivered — the lease
+          is stale, so the new worker legitimately takes over (previously such a
+          task stayed RUNNING forever: the claim was rejected, the message was
+          acked, and neither ``/retry`` nor redelivery could move it);
+        * the task is simply still being processed elsewhere — the lease is
+          fresh, so the claim is rejected as before (no double payment).
+
         Returns ``True`` when this caller claimed the task, ``False`` when it was
-        not ``PENDING`` (already running or terminal), in which case the caller
-        must not execute the work.
+        neither ``PENDING`` nor a stale ``RUNNING`` (already running/terminal), in
+        which case the caller must not execute the work.
         """
+        cfg = get_settings()
+        lease = cfg.task_lease_seconds if lease_seconds is None else lease_seconds
+        cutoff = utcnow() - timedelta(seconds=lease)
+        claimed_statuses = or_(
+            TaskRun.status == TaskStatus.PENDING,
+            and_(
+                TaskRun.status == TaskStatus.RUNNING,
+                # started_at может быть NULL у криво созданной RUNNING-строки —
+                # считаем такую задачу просроченной, а не «вечно живой».
+                or_(TaskRun.started_at.is_(None), TaskRun.started_at < cutoff),
+            ),
+        )
         result = await self.session.execute(
             update(TaskRun)
-            .where(TaskRun.id == task.id, TaskRun.status == TaskStatus.PENDING)
+            .where(
+                TaskRun.id == task.id,
+                claimed_statuses,
+                # Не захватываем сверх лимита попыток: иначе упавший на
+                # последней попытке воркер выжигал бы дополнительные прогоны.
+                TaskRun.attempts < TaskRun.max_attempts,
+            )
             .values(
                 status=TaskStatus.RUNNING,
                 attempts=TaskRun.attempts + 1,
@@ -267,6 +301,51 @@ class TaskService:
             max_attempts=task.max_attempts,
         )
         return True
+
+    async def list_stale_running(
+        self, *, lease_seconds: float | None = None, limit: int = 100
+    ) -> list[TaskRun]:
+        """RUNNING-задачи с истёкшим lease — кандидаты на перезахват.
+
+        Их находит фоновый purge-цикл воркера (см. `tasks/sweeper.py`): без него
+        задача, чей воркер умер уже после claim, осталась бы RUNNING навсегда.
+        """
+        cfg = get_settings()
+        lease = cfg.task_lease_seconds if lease_seconds is None else lease_seconds
+        cutoff = utcnow() - timedelta(seconds=lease)
+        result = await self.session.execute(
+            select(TaskRun)
+            .where(
+                TaskRun.status == TaskStatus.RUNNING,
+                or_(TaskRun.started_at.is_(None), TaskRun.started_at < cutoff),
+            )
+            .order_by(TaskRun.started_at)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def mark_lease_expired(self, task: TaskRun) -> TaskRun:
+        """Увести просроченную RUNNING-задачу без попыток в DEAD_LETTER.
+
+        Вызывается purge-циклом, когда перезахватить нельзя (`attempts >=
+        max_attempts`): перезапуск уже невозможен, и задачу нужно явно завершить,
+        а не оставлять в RUNNING до бесконечности.
+        """
+        result = await self.session.execute(
+            update(TaskRun)
+            .where(TaskRun.id == task.id, TaskRun.status == TaskStatus.RUNNING)
+            .values(
+                status=TaskStatus.DEAD_LETTER,
+                error="lease expired with no attempts left",
+                finished_at=utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.refresh(task)
+        if result.rowcount == 1:
+            record_task_status(task.task_type, task.status.value)
+            logger.error("task.lease_expired_dead_letter", task_id=str(task.id))
+        return task
 
     async def mark_succeeded(
         self,

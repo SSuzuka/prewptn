@@ -5,13 +5,18 @@ from fastapi.testclient import TestClient
 
 from aicore.api.app import create_app
 from aicore.config import reset_settings_cache
+from aicore.db.session import reset_database
 
 
 @pytest.fixture()
 def client() -> TestClient:
     reset_settings_cache()
+    # /ready теперь реально ходит в БД, поэтому изолируем синглтон: иначе
+    # следующий тест получит уже подключённую к файлу базу.
+    reset_database()
     with TestClient(create_app()) as c:
         yield c
+    reset_database()
     reset_settings_cache()
 
 

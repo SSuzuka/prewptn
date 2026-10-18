@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response, status
 from pydantic import BaseModel, Field
 
 from aicore.config import get_settings
+from aicore.db.session import get_database
 
 router = APIRouter()
 
@@ -49,10 +50,36 @@ async def health() -> HealthResponse:
     )
 
 
-@router.get("/ready", response_model=ReadinessResponse, summary="Readiness")
-async def ready() -> ReadinessResponse:
-    """Заглушка: реальные проверки БД/очереди появятся вместе с их клиентами."""
-    return ReadinessResponse(detail="no external dependencies checked yet")
+@router.get(
+    "/ready",
+    response_model=ReadinessResponse,
+    summary="Readiness (проверяет БД и наличие схемы)",
+    responses={503: {"model": ReadinessResponse, "description": "Not ready"}},
+)
+async def ready(response: Response) -> ReadinessResponse:
+    """Readiness: реально проверяет БД и наличие схемы.
+
+    Раньше эндпоинт всегда отвечал `ready`, даже когда БД недоступна или
+    миграции не накатаны — и оркестратор слал трафик в инстанс, который на
+    первом же запросе отдавал 500 (`relation "task_runs" does not exist`).
+    Теперь: подключение + `SELECT 1` + проверка наличия таблицы `task_runs`.
+    Неготовность = 503, чтобы пробу было чем остановить rollout.
+
+    Health/ready намеренно не под rate limit и не под API-ключом.
+    """
+    db = get_database()
+    try:
+        await db.ensure_ready()
+        connected = await db.healthcheck()
+        schema_ok = connected and await db.schema_ready()
+    except Exception:  # noqa: BLE001 — проба не должна падать, только сигналить
+        connected = schema_ok = False
+
+    if not schema_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        detail = "database reachable but schema missing" if connected else "database unreachable"
+        return ReadinessResponse(status="not_ready", detail=detail)
+    return ReadinessResponse(detail="database and schema ok")
 
 
 @router.get("/version", summary="Версия сервиса")

@@ -147,6 +147,16 @@ class Settings(BaseSettings):
     task_retry_use_exponent: bool = Field(default=True)
     task_retry_max_exponent_delay: float = Field(default=60.0, gt=0)
     task_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Lease «живой» обработки. RUNNING-задача считается живой, пока с момента
+    # её захвата (started_at) прошло меньше `task_lease_seconds`. Если воркер
+    # умер, lease истекает, и задачу можно перезахватить (см. tasks/sweeper.py).
+    # Должен быть строго больше task_timeout_seconds: иначе живая, но медленная
+    # задача была бы перехвачена вторым воркером и оплачена дважды.
+    task_lease_seconds: float = Field(default=300.0, gt=0)
+    # Как часто фоновый purge-цикл ищет просроченные RUNNING-задачи.
+    task_lease_sweep_interval_seconds: float = Field(default=30.0, gt=0)
+    # Префикс ключей Redis для отложенных ретраев (RedisScheduleSource).
+    task_retry_schedule_prefix: str = Field(default="aicore:retry-schedules")
 
     # ----------------------------------------------------------------- API
     api_host: str = Field(default="127.0.0.1")
@@ -168,6 +178,12 @@ class Settings(BaseSettings):
     # --------------------------------------------------- наблюдаемость
     log_level: str = Field(default="INFO")
     log_json: bool = Field(default=True)
+
+    # Отдельная Prometheus-экспозиция ВОРКЕРА. Счётчики задач/LLM живут в
+    # процессе воркера, а `/metrics` отдаёт API-процесс: без этой ручки метрики
+    # воркера не видны (в проде — вторая цель скрейпа на этом порту). 0 = выкл.
+    worker_metrics_port: int = Field(default=9100, ge=0, le=65535)
+    worker_metrics_host: str = Field(default="0.0.0.0")
 
     otel_service_name: str = Field(default="aicore")
     otel_exporter_otlp_endpoint: str | None = Field(default=None)
@@ -216,6 +232,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 "rag_chunk_overlap must be smaller than rag_chunk_size "
                 f"({self.rag_chunk_overlap} >= {self.rag_chunk_size})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_task_lease(self) -> Settings:
+        """Lease must outlast the task timeout, or a live task gets re-run.
+
+        A RUNNING task is only re-claimable once its lease expires. If the lease
+        were shorter than `task_timeout_seconds`, a slow-but-alive task would hit
+        the lease first and be re-claimed by another worker — double charging.
+        """
+        if self.task_lease_seconds <= self.task_timeout_seconds:
+            raise ValueError(
+                "task_lease_seconds must be greater than task_timeout_seconds "
+                f"({self.task_lease_seconds} <= {self.task_timeout_seconds})"
             )
         return self
 

@@ -55,17 +55,24 @@ class DocumentService:
         ``created=False`` and nothing is re-indexed.
         """
         digest = content_hash(content)
+        normalized = normalize_content(content)
         existing = await self.get_by_hash(digest)
         if existing is not None:
+            # Backfill for rows created before `content` existed: the indexer
+            # reads the text from here, so an idempotent replay still repairs it.
+            if not existing.content:
+                existing.content = normalized
+                await self.session.flush()
             logger.info("document.idempotent_replay", document_id=str(existing.id))
             return existing, False
 
         document = Document(
             title=title,
             source=source,
+            content=normalized,
             content_hash=digest,
             status=DocumentStatus.PENDING,
-            content_length=len(normalize_content(content)),
+            content_length=len(normalized),
         )
         try:
             # Savepoint (not a full rollback): a lost race must not discard other

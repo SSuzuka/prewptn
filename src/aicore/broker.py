@@ -8,23 +8,32 @@
     Redis Streams поддерживают acknowledge и переотдачу сообщения, если
     воркер умер.
 
-Ретраи настраиваются через SmartRetryMiddleware: exponential backoff + jitter,
-чтобы синхронные ретраи не били пиками по провайдеру.
+Ретраи настраиваются через SmartRetryMiddleware: exponential backoff + jitter.
 
 ВАЖНО про отложенные ретраи (backoff): SmartRetryMiddleware переставляет задачу
-через schedule_source с меткой `delay`. InMemoryBroker не умеет отложенную
-доставку и игнорирует её, поэтому в dev-режиме backoff/jitter фактически
-no-op, а ретрай происходит только когда taskiq повторно исполняет задачу
-сразу (или когда её переставили вручную). Настоящий backoff работает на
-RedisStreamBroker + RedisScheduleSource. Это задокументированное ограничение
-dev-режима, а не баг.
+через `schedule_source` с меткой `delay`. Без `schedule_source` middleware
+крутит ретрай **немедленно**, игнорируя задержку (`on_send` падает в ветку
+`kicker.kiq`), поэтому настроенные `default_delay`/exponent не работают. Поэтому
+для RedisStreamBroker мы создаём `ListRedisScheduleSource` и передаём его в
+middleware, а `TaskiqScheduler` (глобал `scheduler`) исполняет отложенные задачи.
+
+В dev (InMemoryBroker) `schedule_source` остаётся `None`: брокер не умеет
+отложенную доставку, и backoff/jitter фактически no-op. Это задокументированное
+ограничение dev-режима, а не баг. Настоящий backoff работает в проде при
+запущенном `taskiq scheduler aicore.broker:scheduler` (см. README).
+
+Note: `ListRedisScheduleSource` держит собственное соединение и должен быть
+запущен (`startup()`) до первого `add_schedule`; иначе middleware при ретрае
+упадёт. За это отвечает `ensure_schedule_source_started` (воркер) и сам
+`taskiq scheduler` (для отложенной доставки).
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from taskiq import AsyncBroker, InMemoryBroker
+from taskiq import AsyncBroker, InMemoryBroker, TaskiqScheduler
+from taskiq.abc.schedule_source import ScheduleSource
 from taskiq.middlewares import SmartRetryMiddleware
 
 from aicore.config import Settings, get_settings
@@ -33,11 +42,19 @@ from aicore.logging import get_logger
 logger = get_logger(__name__)
 
 
-def build_retry_middleware(settings: Settings | None = None) -> SmartRetryMiddleware:
+def build_retry_middleware(
+    settings: Settings | None = None,
+    *,
+    schedule_source: ScheduleSource | None = None,
+) -> SmartRetryMiddleware:
     """Собрать SmartRetryMiddleware из настроек.
 
     Сигнатура сверена с taskiq 0.13.0 (`default_retry_count`, `default_delay`,
-    `use_jitter`, `use_delay_exponent`, `max_delay_exponent`).
+    `use_jitter`, `use_delay_exponent`, `max_delay_exponent`, `schedule_source`).
+
+    `schedule_source` обязателен для реального отложенного ретрая: без него
+    taskiq ставит задачу в очередь сразу, игнорируя рассчитанный `delay`
+    (см. `SmartRetryMiddleware.on_send`). Передаётся только на Redis-бэкенде.
 
     Примечание: `default_retry_count` — это число ПОВТОРОВ (taskiq semantics):
     задача исполнится не более `default_retry_count + 1` раз. В БД при этом
@@ -54,7 +71,15 @@ def build_retry_middleware(settings: Settings | None = None) -> SmartRetryMiddle
         use_jitter=cfg.task_retry_use_jitter,
         use_delay_exponent=cfg.task_retry_use_exponent,
         max_delay_exponent=cfg.task_retry_max_exponent_delay,
+        schedule_source=schedule_source,
     )
+
+
+# Источник расписания отложенных ретраев; заполняется только в Redis-режиме.
+schedule_source: ScheduleSource | None = None
+# Глобал для `taskiq scheduler aicore.broker:scheduler` (исполняет отложенные
+# задачи). None в dev, где отложенная доставка не поддерживается.
+scheduler: TaskiqScheduler | None = None
 
 
 def build_broker(settings: Settings | None = None) -> AsyncBroker:
@@ -71,11 +96,21 @@ def build_broker(settings: Settings | None = None) -> AsyncBroker:
     в ветке memory — InMemoryBroker. Аннотация была бы неверной как
     InMemoryBroker для обоих случаев.
     """
+    global schedule_source
     cfg = settings or get_settings()
 
     if cfg.broker_backend == "redis":
-        from taskiq_redis import RedisAsyncResultBackend, RedisStreamBroker
+        from taskiq_redis import (
+            ListRedisScheduleSource,
+            RedisAsyncResultBackend,
+            RedisStreamBroker,
+        )
 
+        # Планировщик отложенных ретраев: без него backoff в проде — no-op.
+        schedule_source = ListRedisScheduleSource(
+            url=cfg.redis_url,
+            prefix=cfg.task_retry_schedule_prefix,
+        )
         broker: AsyncBroker = RedisStreamBroker(
             url=cfg.redis_url,
             queue_name=cfg.taskiq_queue,
@@ -88,6 +123,7 @@ def build_broker(settings: Settings | None = None) -> AsyncBroker:
         )
         logger.info("broker.using_redis_streams", url=cfg.redis_url)
     else:
+        schedule_source = None
         broker = InMemoryBroker(await_inplace=True)
         logger.warning(
             "broker.using_in_memory",
@@ -95,11 +131,45 @@ def build_broker(settings: Settings | None = None) -> AsyncBroker:
         )
 
     # Мидлвари регистрируются ПОСЛЕ создания брокера.
-    broker.with_middlewares(build_retry_middleware(cfg))
+    broker.with_middlewares(build_retry_middleware(cfg, schedule_source=schedule_source))
     return broker
 
 
 broker = build_broker()
+# Глобал виден `taskiq scheduler`-процессу; в dev остаётся None.
+scheduler = TaskiqScheduler(broker, [schedule_source]) if schedule_source is not None else None
+
+_source_started = False
+_source_lock = asyncio.Lock()
+
+
+async def ensure_schedule_source_started(settings: Settings | None = None) -> None:
+    """Start the retry schedule source once, if one is configured.
+
+    The middleware's `add_schedule` hits the source's Redis connection, so it must
+    be started before the first delayed retry. The taskiq *scheduler* process
+    starts its own source; the *worker* starts it here.
+    """
+    global _source_started
+    del settings  # reserved for parity with the other builders
+    if schedule_source is None or _source_started:
+        return
+    async with _source_lock:
+        if not _source_started:
+            await schedule_source.startup()
+            _source_started = True
+            logger.info("broker.schedule_source_started")
+
+
+async def shutdown_schedule_source() -> None:
+    """Stop the retry schedule source if this process started it."""
+    global _source_started
+    if schedule_source is None or not _source_started:
+        return
+    await schedule_source.shutdown()
+    _source_started = False
+    logger.info("broker.schedule_source_shutdown")
+
 
 _broker_started = False
 _broker_start_lock = asyncio.Lock()
@@ -120,6 +190,12 @@ async def ensure_broker_started() -> None:
     """
     global _broker_started
     if _broker_started:
+        return
+    # В процессе воркера брокер уже поднят самим taskiq (`is_worker_process`):
+    # повторный `startup()` из sweeper-пути (enqueue перезахваченной задачи)
+    # дублировал бы consumer-группу и worker-хуки.
+    if getattr(broker, "is_worker_process", False):
+        _broker_started = True
         return
     async with _broker_start_lock:
         if not _broker_started:

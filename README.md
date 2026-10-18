@@ -51,9 +51,9 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 275 тестов
-uv run ruff check src tests scripts  # линтер
-uv run ruff format --check src tests scripts
+uv run pytest                        # 306 тестов
+uv run ruff check src tests scripts migrations  # линтер
+uv run ruff format --check src tests scripts migrations
 uv run python scripts/demo.py            # конфиг, логи, health-check
 uv run python scripts/check_stage1.py    # config + logging
 uv run python scripts/check_stage2.py    # БД, брокер, retries, DLQ
@@ -272,7 +272,10 @@ task_retry_delay_seconds:     float = 5.0
 task_retry_use_jitter:        bool  = True
 task_retry_use_exponent:      bool  = True    # экспоненциальный backoff
 task_retry_max_exponent_delay: float = 60.0   # потолок задержки
+task_retry_schedule_prefix:   str   = "aicore:retry-schedules"  # ключи Redis для отложенных ретраев
 task_timeout_seconds:         float = 120.0
+task_lease_seconds:           float = 300.0  # > task_timeout_seconds: lease «живой» RUNNING-задачи
+task_lease_sweep_interval_seconds: float = 30.0  # период перезахвата просроченных RUNNING
 
 # --- LLM ---
 llm_model:            str   = "gpt-4o-mini"
@@ -328,6 +331,8 @@ langfuse_secret_key:  str | None = None
 | `qdrant_url` | `http://localhost:6333` | `vector_backend=qdrant` |
 | `qdrant_collection` | `aicore_documents` | имя коллекции векторов |
 | `embedding_dim` | `384` | под конкретную модель эмбеддингов |
+| `worker_metrics_port` | `9100` | порт Prometheus-экспортёра воркера (`0` = выключен) |
+| `worker_metrics_host` | `0.0.0.0` | адрес привязки экспортёра воркера |
 | `openai_base_url` | `https://api.openai.com/v1` | совместимый endpoint / прокси |
 | `log_level` | `INFO` | отладка (`DEBUG`) |
 | `log_json` | `True` | `False` для читаемого вывода в dev |
@@ -366,8 +371,22 @@ cp .env.example .env          # выставить prod-значения
 docker compose up -d          # postgres + redis + qdrant
 uv run alembic upgrade head   # миграции
 uv run taskiq worker aicore.broker:broker          # воркер
+uv run taskiq scheduler aicore.broker:scheduler    # отложенные ретраи (backoff)
 uv run uvicorn aicore.api.app:app --workers 4      # API
 ```
+
+> **Scheduler обязателен в проде.** Без процесса `taskiq scheduler` ретраи
+> происходят **немедленно**: middleware кладёт отложенную задачу в
+> `ListRedisScheduleSource`, но исполняет её именно планировщик. Отсутствие
+> scheduler'а = «3 попытки за 0,3 с» вместо backoff, то есть 429 от провайдера
+> сжигает все попытки почти сразу.
+>
+> **Метрики воркера.** Счётчики задач/LLM (`aicore_tasks_total`,
+> `aicore_llm_calls_total`, …) растут в процессе воркера, а `/metrics` отдаёт
+> API. Воркер поднимает собственный Prometheus-экспортёр на
+> `WORKER_METRICS_PORT` (по умолчанию `9100`) — добавьте его второй целью
+> скрейпа. Альтернатива для нескольких воркеров на одном хосте —
+> multiprocess-режим `prometheus_client` (фаза 2) или уникальный порт на процесс.
 
 В `.env` для прода:
 
@@ -406,7 +425,7 @@ uv sync --extra embeddings # fastembed (ONNX): бесплатные локаль
 
 | Job | Триггер | Что делает |
 |---|---|---|
-| `test` | push, PR | `ruff check`, `ruff format --check`, `pytest` на Python 3.11, 3.12 и 3.13 (офлайн) |
+| `test` | push, PR | `ruff check`, `ruff format --check` (src/tests/scripts/migrations), `pytest` на Python 3.11, 3.12 и 3.13 (офлайн) |
 | `docker` | push, PR | сборка `Dockerfile` без пуша — ловит ошибки образа на PR |
 | `publish` | push в `main`/теги, `needs: [test, docker]` | собирает и пушит образ в GHCR |
 
@@ -530,11 +549,61 @@ prompt_per_1k, completion_per_1k)` — единственная точка ра�
 расхождение маскируется — поэтому есть регресс-тест на метаданные.
 
 **Ограничение dev-режима ретраев.** `SmartRetryMiddleware` переставляет задачу
-через schedule_source с меткой `delay`, но `InMemoryBroker` не умеет отложенную
-доставку и игнорирует её. Поэтому в dev-режиме backoff/jitter фактически no-op;
-настоящий отложенный ретрай работает на `RedisStreamBroker` + `RedisScheduleSource`.
-Источник правды о лимите попыток — БД (`TaskRun.max_attempts`), middleware-счётчик
-служит предохранителем на стороне брокера.
+через `schedule_source` с меткой `delay`. В проде брокеру передаётся
+`ListRedisScheduleSource`, и отложенную доставку исполняет процесс
+`taskiq scheduler` — без него задержка игнорируется и ретрай идёт немедленно.
+В dev `InMemoryBroker` не умеет отложенную доставку, поэтому backoff/jitter
+фактически no-op. Источник правды о лимите попыток — БД (`TaskRun.max_attempts`),
+middleware-счётчик служит предохранителем на стороне брокера.
+
+**Lease против «навсегда RUNNING» после падения воркера.** Атомарный claim
+(`UPDATE ... WHERE status='pending'`) защищает от двойной оплаты, но у него был
+побочный эффект: если воркер убить посреди задачи, redelivered-сообщение
+отклонялось (статус уже `RUNNING`), сообщение подтверждалось, и задача висела в
+`RUNNING` навсегда (SSE до таймаута, `/retry` → 409). Теперь у `RUNNING`-задачи
+есть lease: пока `now - started_at < task_lease_seconds`, перезахват запрещён
+(защита от дублей), а просроченную задачу фоновый purge-цикл воркера
+(`tasks/sweeper.py`) переставляет обратно в очередь, и живой воркер её
+перезахватывает. `task_lease_seconds` обязан быть больше `task_timeout_seconds`,
+иначе живая медленная задача была бы перехвачена и оплачена дважды (валидируется
+на старте). Задача без остатка попыток уводится в `DEAD_LETTER`, а не крутится
+вечно.
+
+**Метрики воркера видны через отдельный экспортёр.** Счётчики задач/LLM
+инкрементируются в процессе воркера, а `/metrics` отдаёт API-процесс — раньше
+`aicore_tasks_total` и `aicore_llm_calls_total` не появлялись ни в одном скрейпе.
+Воркер поднимает собственный Prometheus-экспортёр на `worker_metrics_port`
+(по умолчанию 9100; `0` выключает). Конфликт порта при нескольких воркерах на
+хосте не фатален: логируется предупреждение, процесс продолжает работу.
+
+**`/ready` действительно проверяет БД.** Раньше эндпоинт всегда отвечал
+`ready`, даже если БД недоступна или миграции не накатаны, и оркестратор слал
+трафик в инстанс, падавший на первом запросе. Теперь `/ready` делает
+`SELECT 1` **и** читает `task_runs`: без схемы — 503. Это ловит «подняли API,
+забыли `alembic upgrade head`».
+
+**Не-ASCII `X-API-Key` — это 401, а не 500.** `secrets.compare_digest` для
+`str` требует ASCII-only и на ключе вроде `café` бросал `TypeError`. Сравниваем
+`bytes` (`.encode("utf-8")`) — сравнение остаётся constant-time, а нештатный
+ключ корректно отклоняется.
+
+**`X-Forwarded-For`: доверяем правому адресу.** В цепочке `client, proxy1, ...`
+каждый узел дописывает источник справа. Левые адреса задаёт клиент, поэтому
+брать `split(",", 1)[0]` (как было раньше) — значит позволять обойти rate limit
+подделкой заголовка. Теперь берётся последний элемент — тот, что дописал
+ближайший доверенный прокси.
+
+**Текст документа хранится на строке `Document`, а не в payload задачи.**
+До 1 МБ текста ехало в сообщении очереди (Redis) и в JSONB `task_runs.payload`
+на каждую индексацию. Колонка `Document.content` (nullable) — источник правды;
+payload несёт только `document_id`. Индексер читает текст из строки, а старый
+payload-support оставлен fallback'ом.
+
+**Модель общих API-ключей — без изоляции тенантов.** `api_keys` — это список
+разделённых ключей: все они дают доступ ко всем задачам и документам. Поэтому
+`bob-key` может прочитать задачу `alice-key` (и по тому же `Idempotency-Key`
+скоупа не изолированы по ключу-владельцу). Это осознанный предел MVP, а не баг;
+настоящая изоляция — per-key identity/scope (фаза 2).
 
 **Langfuse 4.x на OpenTelemetry, а не 5.x.** API `get_client()` +
 `start_as_current_observation(as_type="generation")` присутствует уже в 4.x и
@@ -592,10 +661,11 @@ fusion: не нужна калибровка скоров, работает де
 превышает `rag_context_max_chars`; обязательное реранжирование — не догма (в
 публичных бенчмарках оно местами вредит), поэтому здесь его нет, есть гибрид.
 
-**`Document` хранит метаданные, текст — в payload задачи.** Колонки `content`
-нет намеренно: чанки живут в векторном хранилище, а исходный текст — входной
-параметр задания индексации. Идемпотентность загрузки — по `content_hash`
-(уникален), поэтому повторная загрузка того же текста не жжёт эмбеддинги.
+**`Document` хранит метаданные и текст на строке (не в payload).** Чанки живут
+в векторном хранилище, а `Document.content` (nullable) держит исходный текст,
+чтобы до 1 МБ не ехало в очереди и в `task_runs.payload`. Идемпотентность
+загрузки — по `content_hash` (уникален), поэтому повторная загрузка того же
+текста не жжёт эмбеддинги.
 
 **Агенты — subagents-as-tools, а не `create_supervisor`.** С октября 2025
 `langgraph-supervisor`/`create_supervisor` больше не поддерживается; официальный
@@ -634,8 +704,8 @@ LangChain `BaseChatModel`; чтобы граф (модель → tools → мо�
 ставится чистым ASGI-мидлварем (не `BaseHTTPMiddleware` — тот ломает SSE):
 берётся из `X-Correlation-ID`/`X-Request-ID` или генерируется и возвращается
 в заголовке. Rate limit стоит на всех `/v1`-эндпоинтах, включая чтение и SSE;
-за доверенным прокси (`trust_proxy_headers=true`) клиент берётся из
-`X-Forwarded-For`.
+за доверенным прокси (`trust_proxy_headers=true`) клиент берётся из **правого**
+адреса `X-Forwarded-For` (его дописал прокси, левые задаёт клиент).
 
 ---
 
@@ -708,15 +778,18 @@ uop/
 │   │       ├── documents.py         ✅ /v1/documents (загрузка/статус/список)
 │   │       ├── agents.py            ✅ /v1/agents (запуск агента)
 │   │       └── metrics.py           ✅ /metrics
-│   ├── broker.py                    ✅ InMemory | RedisStream + SmartRetryMiddleware
+│   ├── broker.py                    ✅ InMemory | RedisStream + SmartRetryMiddleware + schedule_source
+│   ├── worker.py                    ✅ рантайм воркера: метрики, schedule source, lease-sweeper
 │   ├── db/                          ✅ этап 2
 │   │   ├── __init__.py              ✅
 │   │   ├── base.py                  ✅ Base, naming_convention, url_is_sqlite
-│   │   ├── models.py                ✅ TaskRun, Document, IdempotencyKey
+│   │   ├── dsn.py                   ✅ escape_percent для Alembic
+│   │   ├── models.py                ✅ TaskRun, Document (+content), IdempotencyKey
 │   │   └── session.py               ✅ async-движок, сессии, create_all (dev), PRAGMA FK
 │   ├── tasks/                       ✅ этап 2
 │   │   ├── __init__.py              ✅
-│   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ
+│   │   ├── service.py               ✅ статусы, идемпотентность, retries, DLQ, lease-claim
+│   │   ├── sweeper.py               ✅ перезахват просроченных RUNNING-задач
 │   │   ├── ping.py                  ✅ задача-образец с ретраями
 │   │   ├── llm.py                   ✅ answer_question: LLM + метрики в TaskRun
 │   │   ├── rag_index.py             ✅ index_document: chunking → embed → Qdrant

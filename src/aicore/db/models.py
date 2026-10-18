@@ -158,6 +158,13 @@ class Document(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
+    # Нормализованный текст документа. Живёт на строке, а не в payload задачи
+    # индексации: до 1 МБ текста в сообщении очереди (Redis) и в
+    # `task_runs.payload` — лишний трафик и раздувание JSONB. Индексер читает
+    # текст отсюда по document_id. Nullable — для строк, созданных до появления
+    # колонки.
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # SHA-256 от нормализованного содержимого — основа идемпотентности.
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
 

@@ -142,8 +142,31 @@ async def _run(task_id: str, *, fail_times: int, delay_seconds: float = 0.0) -> 
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
 async def _on_worker_startup(state: Any) -> None:  # noqa: ANN401
-    """При старте воркера гарантируем, что схема БД существует."""
-    db = get_database()
-    await db.connect()
-    await db.create_all()
-    logger.info("worker.startup.complete")
+    """Поднять рантайм воркера: схема, метрики, schedule source, lease-sweeper.
+
+    Схема (``ensure_ready``) создаёт таблицы только для SQLite; на Postgres это
+    делает Alembic. Раньше здесь был безусловный ``create_all()``, который на
+    пустом Postgres гонялся с ``alembic upgrade head`` и падал с
+    ``type "document_status" already exists``.
+
+    Гард `is_worker_process`: событие WORKER_STARTUP срабатывает на любом
+    `broker.startup()`, включая ленивый старт в API-процессе при постановке
+    задачи (и в тестах). Рантайм (экспортёр метрик, sweeper, schedule source)
+    нужен ТОЛЬКО реальному воркеру taskiq — иначе API плодил бы лишние
+    listener'ы на порту метрик и дублирующий purge-цикл.
+    """
+    if not broker.is_worker_process:
+        return
+    from aicore.worker import start_worker_runtime
+
+    await start_worker_runtime()
+
+
+@broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
+async def _on_worker_shutdown(state: Any) -> None:  # noqa: ANN401
+    """Остановить фоновые ресурсы воркера (sweeper, метрики, schedule source)."""
+    if not broker.is_worker_process:
+        return
+    from aicore.worker import stop_worker_runtime
+
+    await stop_worker_runtime()

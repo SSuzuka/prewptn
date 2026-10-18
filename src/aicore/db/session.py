@@ -156,6 +156,22 @@ class Database:
             logger.warning("db.healthcheck_failed", error=str(exc))
             return False
 
+    async def schema_ready(self) -> bool:
+        """Проверка, что схема накатана (есть таблица `task_runs`).
+
+        `SELECT 1` отвечает и на пустой БД без миграций, поэтому readiness по
+        одному соединению врал бы «ready» на инстансе, который на первом же
+        запросе падает с `relation "task_runs" does not exist`. Читаем из
+        таблицы, чтобы поймать отсутствие миграций.
+        """
+        try:
+            async with self.session_factory() as session:
+                await session.execute(text("SELECT 1 FROM task_runs LIMIT 1"))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("db.schema_not_ready", error=str(exc))
+            return False
+
     @staticmethod
     def enable_sqlite_foreign_keys(engine: AsyncEngine) -> None:
         """Включить PRAGMA foreign_keys=ON для SQLite.

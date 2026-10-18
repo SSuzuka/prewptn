@@ -98,8 +98,9 @@ async def rate_limit(request: Request) -> None:
     """Зависимость: 429, если клиент превысил лимит запросов в минуту.
 
     Клиент определяется по IP. За доверенным прокси (proxy_headers) берётся
-    первый адрес из `X-Forwarded-For` — иначе все клиенты за одним прокси
-    делили бы один счётчик, а лимит вырождался бы.
+    **правый** адрес из `X-Forwarded-For` — тот, который дописал ближайший
+    доверенный прокси. Левые адреса задаёт сам клиент, поэтому брать их значит
+    позволять обойти лимит подделкой заголовка.
     """
     limiter = get_rate_limiter()
     client = _client_key(request)
@@ -112,13 +113,20 @@ async def rate_limit(request: Request) -> None:
 
 
 def _client_key(request: Request) -> str:
-    """Ключ клиента для лимитера: IP, с учётом доверенного прокси."""
+    """Ключ клиента для лимитера: IP, с учётом доверенного прокси.
+
+    `X-Forwarded-For` — это цепочка `client, proxy1, proxy2, ...`, куда КАЖДЫЙ
+    узел дописывает источник справа. Клиент может подделать левые значения
+    (или весь заголовок), но правый элемент дописан доверенным прокси — только
+    ему и можно верить. Раньше брался левый (`split(",", 1)[0]`), и лимит
+    обходился запросами с разными фейковыми XFF.
+    """
     if get_settings().trust_proxy_headers:
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
-            first = forwarded.split(",", 1)[0].strip()
-            if first:
-                return first
+            last = forwarded.rsplit(",", 1)[-1].strip()
+            if last:
+                return last
     return request.client.host if request.client else "anonymous"
 
 
@@ -129,14 +137,24 @@ async def require_api_key(request: Request) -> None:
     открытым для локального запуска (как и остальные in-memory дефолты), но
     закрытый режим включается одной переменной окружения. Сравнение —
     constant-time, чтобы не течь по таймингу.
+
+    Сравниваем байты, а не `str`: HTTP-заголовок может содержать не-ASCII
+    (например, `café`), а `secrets.compare_digest` для `str` требует
+    ASCII-only и на таком ключе бросал `TypeError` -> 500 вместо 401.
     """
     keys = get_settings().api_keys
     if not keys:
         return
     presented = request.headers.get("x-api-key")
-    if presented is None or not any(secrets.compare_digest(presented, key) for key in keys):
+    if presented is None or not _key_matches(presented, keys):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or missing API key",
             headers={"WWW-Authenticate": "ApiKey"},
         )
+
+
+def _key_matches(presented: str, keys: list[str]) -> bool:
+    """Constant-time сравнение ключа; не-ASCII не роняет запрос."""
+    presented_bytes = presented.encode("utf-8")
+    return any(secrets.compare_digest(presented_bytes, key.encode("utf-8")) for key in keys)

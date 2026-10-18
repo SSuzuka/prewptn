@@ -5,8 +5,10 @@
 ``pending → indexing → indexed``; постоянная ошибка эмбеддера уводит и документ
 (``failed``), и задачу (dead-letter) — временные ретраит брокер.
 
-Текст документа приходит в payload задачи (у ``Document`` нет колонки content):
-это входной параметр задания, а сами чанки живут в векторном хранилище.
+Текст документа читается из строки `Document` (колонка `content`), а не из
+payload: до 1 МБ текста в сообщении очереди и в `task_runs.payload` — лишний
+трафик. Payload несёт только `document_id`; fallback на `payload["content"]`
+оставлен для задач, созданных старым кодом.
 """
 
 from __future__ import annotations
@@ -62,12 +64,15 @@ async def _run(task_id: str) -> dict[str, Any]:
             await svc.mark_failed(task, "document not found", retryable=False)
             return {"status": "dead_letter", "task_id": task_id, "error": "document not found"}
         await docsvc.mark_indexing(document)
+        # Текст берём из строки документа (источник правды), а payload — только
+        # fallback для задач, созданных старым кодом, где текст ехал в payload.
+        content = document.content or str(payload.get("content") or "")
 
     # Фаза 2: чанкинг + эмбеддинги без удержания БД-соединения.
     cfg = get_settings()
     try:
         chunks = chunk_text(
-            str(payload.get("content") or ""),
+            content,
             chunk_size=cfg.rag_chunk_size,
             chunk_overlap=cfg.rag_chunk_overlap,
         )
