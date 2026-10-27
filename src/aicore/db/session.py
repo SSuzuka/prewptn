@@ -9,11 +9,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from sqlalchemy import event, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -42,6 +43,11 @@ class Database:
         self.settings = settings or get_settings()
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        # Один lock на инициализацию: connect() выставляет _engine до того, как
+        # create_all() закончит, поэтому без сериализации конкуренты видели
+        # "уже подключено" и падали на ещё не созданных таблицах.
+        self._init_lock = asyncio.Lock()
+        self._ready = False
 
     @property
     def engine(self) -> AsyncEngine:
@@ -78,30 +84,38 @@ class Database:
 
         return create_async_engine(url, **kwargs)
 
-    async def connect(self) -> None:
-        """Создать движок и фабрику сессий."""
-        if self._engine is not None:
-            return
-
-        self._engine = self._build_engine()
+    def _connect_unlocked(self) -> None:
+        """Build the engine/session factory; caller must hold `_init_lock`."""
+        engine = self._build_engine()
         if url_is_sqlite(self.settings.db_url):
-            self.enable_sqlite_foreign_keys(self._engine)
+            self.enable_sqlite_foreign_keys(engine)
 
+        self._engine = engine
         self._session_factory = async_sessionmaker(
-            bind=self._engine,
+            bind=engine,
             class_=AsyncSession,
             expire_on_commit=False,  # объекты остаются читаемыми после commit
             autoflush=False,
         )
-        logger.info("db.connected", dialect=self._engine.dialect.name)
+        logger.info("db.connected", dialect=engine.dialect.name)
+
+    async def connect(self) -> None:
+        """Создать движок и фабрику сессий."""
+        if self._engine is not None:
+            return
+        async with self._init_lock:
+            if self._engine is None:
+                self._connect_unlocked()
 
     async def disconnect(self) -> None:
         """Закрыть движок."""
-        if self._engine is not None:
-            await self._engine.dispose()
-            logger.info("db.disconnected")
-        self._engine = None
-        self._session_factory = None
+        async with self._init_lock:
+            if self._engine is not None:
+                await self._engine.dispose()
+                logger.info("db.disconnected")
+            self._engine = None
+            self._session_factory = None
+            self._ready = False
 
     # --------------------------------------------------------------- sessions
     @asynccontextmanager
@@ -125,6 +139,30 @@ class Database:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("db.schema_created", tables=sorted(Base.metadata.tables))
 
+    async def _add_sqlite_compat_columns(self) -> None:
+        """Дописать аддитивные колонки в старый dev-SQLite.
+
+        `create_all()` создаёт отсутствующие таблицы, но не добавляет колонки в
+        уже существующие. Из-за этого `local.db`, созданный до миграции
+        b2f5a9c7d1e3, падал на `documents.content` при каждом запросе. Для
+        dev/test достаточно добавить известную аддитивную колонку; prod-схему
+        по-прежнему двигает только Alembic.
+        """
+        async with self.engine.begin() as conn:
+
+            def _columns(sync_conn: Any) -> set[str]:
+                return {column["name"] for column in inspect(sync_conn).get_columns("documents")}
+
+            columns = await conn.run_sync(_columns)
+            if "content" not in columns:
+                await conn.execute(text("ALTER TABLE documents ADD COLUMN content TEXT"))
+                logger.warning(
+                    "db.sqlite_compat_column_added",
+                    table="documents",
+                    column="content",
+                    note="dev-only; run alembic upgrade head for real schema changes",
+                )
+
     async def ensure_ready(self) -> None:
         """Подключиться и создать схему один раз (удобство для dev/тестов).
 
@@ -135,11 +173,23 @@ class Database:
         Авто-создание схемы — только для SQLite (dev/test). В проде на Postgres
         это делает Alembic: `create_all()` из нескольких воркеров/процессов
         гоняется за созданием таблиц и enum-типов.
+
+        The whole check-connect-create sequence is serialized: `connect()` used
+        to publish `_engine` before `create_all()` finished, so a concurrent
+        first request saw a "connected" database and queried tables that did not
+        exist yet (15–95% of the first 20 requests on a fresh SQLite file).
         """
-        if self._engine is None:
-            await self.connect()
+        if self._ready:
+            return
+        async with self._init_lock:
+            if self._ready:
+                return
+            if self._engine is None:
+                self._connect_unlocked()
             if url_is_sqlite(self.settings.db_url):
                 await self.create_all()
+                await self._add_sqlite_compat_columns()
+            self._ready = True
 
     async def drop_all(self) -> None:
         """Удалить все таблицы — только для тестов."""
@@ -157,16 +207,25 @@ class Database:
             return False
 
     async def schema_ready(self) -> bool:
-        """Проверка, что схема накатана (есть таблица `task_runs`).
+        """Проверка, что схема накатана (таблицы и критичные колонки).
 
         `SELECT 1` отвечает и на пустой БД без миграций, поэтому readiness по
         одному соединению врал бы «ready» на инстансе, который на первом же
-        запросе падает с `relation "task_runs" does not exist`. Читаем из
-        таблицы, чтобы поймать отсутствие миграций.
+        запросе падает с `relation "task_runs" does not exist`. Проверяем не
+        только наличие `task_runs`, но и колонки, которые появились позже:
+        `documents.content` (миграция b2f5a9c7d1e3) и
+        `idempotency_keys.request_fingerprint`. Иначе `/ready` зелёный, а
+        `POST /v1/documents` отдаёт 500.
         """
+        checks = (
+            "SELECT id, status, attempts, max_attempts FROM task_runs LIMIT 1",
+            "SELECT id, content, content_hash FROM documents LIMIT 1",
+            "SELECT key, scope, request_fingerprint FROM idempotency_keys LIMIT 1",
+        )
         try:
             async with self.session_factory() as session:
-                await session.execute(text("SELECT 1 FROM task_runs LIMIT 1"))
+                for statement in checks:
+                    await session.execute(text(statement))
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("db.schema_not_ready", error=str(exc))

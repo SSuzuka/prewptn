@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 
-# One image runs both processes: the FastAPI API (default CMD) and the taskiq
-# worker (`taskiq worker aicore.broker:broker`). Override the command to run
-# the worker. The production extras (redis/postgres/openai/embeddings) are
-# installed so the image can reach Redis Streams, PostgreSQL, an
+# One image runs all processes: the FastAPI API (default CMD), the taskiq
+# worker (`taskiq worker aicore.broker:broker`), the scheduler
+# (`taskiq scheduler aicore.broker:scheduler`) and Alembic migrations. Override
+# the command to run each one. The production extras (redis/postgres/openai/
+# embeddings) are installed so the image can reach Redis Streams, PostgreSQL, an
 # OpenAI-compatible API and local (fastembed/ONNX) embeddings for RAG.
 FROM python:3.12-slim AS base
 
@@ -35,6 +36,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # reads it as the package readme while building the project metadata.
 COPY pyproject.toml uv.lock ./
 COPY README.md ./
+COPY alembic.ini ./
+COPY migrations ./migrations
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --extra redis --extra postgres --extra openai --extra embeddings
@@ -42,10 +45,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Run as a non-root user. The fastembed/HF cache dirs must be writable: the
-# local embedding model is downloaded once on first use.
+# local embedding model is downloaded once on first use. Prometheus multiprocess
+# mode (PROMETHEUS_MULTIPROC_DIR) opens files in /tmp/prometheus at import, so
+# the directory must exist and be owned by the runtime user even when a named
+# volume is mounted over it.
 RUN useradd --create-home --uid 1000 app \
-    && mkdir -p /app/.cache/fastembed /app/.cache/huggingface \
-    && chown -R app:app /app
+    && mkdir -p /app/.cache/fastembed /app/.cache/huggingface /tmp/prometheus \
+    && chown -R app:app /app /tmp/prometheus
 USER app
 
 EXPOSE 8000

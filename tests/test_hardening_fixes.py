@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -95,7 +95,7 @@ class TestSweeper:
     ) -> None:
         enqueued: list[str] = []
 
-        async def fake_enqueue(task_id: str) -> None:
+        async def fake_enqueue(task_id: str, **_: object) -> None:
             enqueued.append(task_id)
 
         monkeypatch.setattr(sweeper, "_ENQUEUERS", {"answer_question": fake_enqueue})
@@ -122,7 +122,7 @@ class TestSweeper:
     ) -> None:
         enqueued: list[str] = []
 
-        async def fake_enqueue(task_id: str) -> None:
+        async def fake_enqueue(task_id: str, **_: object) -> None:
             enqueued.append(task_id)
 
         monkeypatch.setattr(sweeper, "_ENQUEUERS", {"answer_question": fake_enqueue})
@@ -155,8 +155,83 @@ class TestSweeper:
 
         assert await sweeper.reclaim_stale_tasks(db=db, lease_seconds=300.0) == 0
 
+    @pytest.mark.asyncio
+    async def test_stale_pending_is_reenqueued(
+        self, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        enqueued: list[str] = []
 
-async def _noop_enqueue(task_id: str) -> None:
+        async def fake_enqueue(task_id: str, **_: object) -> bool:
+            enqueued.append(task_id)
+            return True
+
+        monkeypatch.setattr(sweeper, "_ENQUEUERS", {"answer_question": fake_enqueue})
+        task_id = await _pending(db)
+        async with db.session() as session:
+            task = await TaskService(session).get_task(task_id)
+            assert task is not None
+            task.queued_at = utcnow() - timedelta(seconds=10_000)
+
+        count = await sweeper.reclaim_stale_pending(db=db, older_than_seconds=1.0)
+        assert count == 1
+        assert enqueued == [str(task_id)]
+
+        # queued_at сдвинут: следующий sweep не переставит ту же задачу сразу.
+        async with db.session() as session:
+            task = await TaskService(session).get_task(task_id)
+        assert task is not None and task.queued_at is not None
+        queued = task.queued_at
+        if queued.tzinfo is None:
+            queued = queued.replace(tzinfo=UTC)
+        assert queued > utcnow() - timedelta(seconds=10)
+
+    @pytest.mark.asyncio
+    async def test_ancient_pending_is_dead_lettered(
+        self, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        enqueued: list[str] = []
+
+        async def fake_enqueue(task_id: str, **_: object) -> bool:
+            enqueued.append(task_id)
+            return True
+
+        monkeypatch.setattr(sweeper, "_ENQUEUERS", {"answer_question": fake_enqueue})
+        task_id = await _pending(db)
+        async with db.session() as session:
+            task = await TaskService(session).get_task(task_id)
+            assert task is not None
+            task.queued_at = utcnow() - timedelta(days=30)
+
+        assert await sweeper.reclaim_stale_pending(db=db, older_than_seconds=1.0) == 0
+        assert enqueued == []
+
+        # Заброшенная PENDING не воскрешается, но получает терминальный статус:
+        # иначе она невидима для диагностики и недоступна для ручного /retry.
+        async with db.session() as session:
+            task = await TaskService(session).get_task(task_id)
+        assert task is not None
+        assert task.status is TaskStatus.DEAD_LETTER
+        assert task.error == "pending too long without being claimed"
+        assert task.finished_at is not None
+
+    @pytest.mark.asyncio
+    async def test_failed_pending_reenqueue_is_not_counted(
+        self, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def failing_enqueue(task_id: str, **_: object) -> bool:
+            return False
+
+        monkeypatch.setattr(sweeper, "_ENQUEUERS", {"answer_question": failing_enqueue})
+        task_id = await _pending(db)
+        async with db.session() as session:
+            task = await TaskService(session).get_task(task_id)
+            assert task is not None
+            task.queued_at = utcnow() - timedelta(seconds=10_000)
+
+        assert await sweeper.reclaim_stale_pending(db=db, older_than_seconds=1.0) == 0
+
+
+async def _noop_enqueue(task_id: str, **_: object) -> None:
     return None
 
 
@@ -448,6 +523,21 @@ class TestForwardedFor:
         assert _client_key(Request(scope)) == "8.8.8.8"
         reset_settings_cache()
 
+    def test_trusted_proxy_count_skips_two_proxies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TRUST_PROXY_HEADERS", "true")
+        monkeypatch.setenv("TRUSTED_PROXY_COUNT", "2")
+        reset_settings_cache()
+        # client, proxy1, proxy2 -> второй справа (proxy1) не клиент; берём client.
+        assert _client_key(_request_with_xff("1.1.1.1, 10.0.0.7, 10.0.0.8")) == "10.0.0.7"
+        reset_settings_cache()
+
+    def test_short_chain_falls_back_to_socket(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TRUST_PROXY_HEADERS", "true")
+        monkeypatch.setenv("TRUSTED_PROXY_COUNT", "2")
+        reset_settings_cache()
+        assert _client_key(_request_with_xff("1.1.1.1")) == "9.9.9.9"
+        reset_settings_cache()
+
     @pytest.mark.asyncio
     async def test_forged_leftmost_does_not_bypass_limit(
         self, monkeypatch: pytest.MonkeyPatch
@@ -479,6 +569,35 @@ class TestForwardedFor:
             assert 429 not in statuses2
         reset_settings_cache()
         reset_rate_limiter()
+
+
+# ------------------------------------------------------------------- SSE slots
+class TestSseConcurrencyLimit:
+    @pytest.mark.asyncio
+    async def test_slots_are_limited_and_released(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from aicore.api.routes.tasks import (
+            _acquire_stream_slot,
+            _release_stream_slot,
+            _StreamSlot,
+            reset_stream_slots,
+        )
+
+        monkeypatch.setenv("SSE_MAX_CONCURRENT_STREAMS", "1")
+        reset_settings_cache()
+        reset_stream_slots()
+        assert await _acquire_stream_slot() is True
+        assert await _acquire_stream_slot() is False
+        await _release_stream_slot()
+        assert await _acquire_stream_slot() is True
+
+        # Double release (generator finally + response background) is a no-op.
+        slot = _StreamSlot()
+        await slot.release()
+        await slot.release()
+        assert await _acquire_stream_slot() is True
+        await _release_stream_slot()
+        await _release_stream_slot()
+        reset_settings_cache()
 
 
 # ------------------------------------------------------------------- embeddings
@@ -558,9 +677,23 @@ class TestConfigGuards:
         with pytest.raises(ValidationError):
             Settings(task_timeout_seconds=100.0, task_lease_seconds=100.0)
 
+    def test_schedule_prefix_normalizes_colon(self) -> None:
+        with pytest.warns(RuntimeWarning, match="task_retry_schedule_prefix"):
+            cfg = Settings(task_retry_schedule_prefix="aicore:retry-schedules")
+        assert cfg.task_retry_schedule_prefix == "aicore-retry-schedules"
+
+    def test_schedule_prefix_default_is_safe(self) -> None:
+        assert ":" not in Settings().task_retry_schedule_prefix
+
+    def test_pending_sweep_must_exceed_backoff(self) -> None:
+        with pytest.raises(ValidationError, match="task_pending_sweep_seconds"):
+            Settings(task_pending_sweep_seconds=10.0, task_retry_max_exponent_delay=60.0)
+
     def test_defaults_are_consistent(self) -> None:
         cfg = Settings()
         assert cfg.task_lease_seconds > cfg.task_timeout_seconds
+        assert cfg.task_pending_sweep_seconds > cfg.task_retry_max_exponent_delay
+        assert cfg.worker_metrics_host == "127.0.0.1"
 
 
 def test_is_testing_true_under_pytest() -> None:

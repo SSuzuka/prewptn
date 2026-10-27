@@ -9,6 +9,8 @@ in-memory БД, и таблицы, созданные в одном соедин
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -42,6 +44,8 @@ async def db() -> Database:
         expire_on_commit=False,
         autoflush=False,
     )
+    database._init_lock = asyncio.Lock()
+    database._ready = True
 
     yield database
 

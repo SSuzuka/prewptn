@@ -32,7 +32,7 @@ def tool_calls(messages: Sequence[Any]) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
     for message in messages:
         if isinstance(message, AIMessage):
-            calls.extend(message.tool_calls or [])
+            calls.extend(dict(call) for call in message.tool_calls or [])
     return calls
 
 

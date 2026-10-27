@@ -20,6 +20,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import SecretStr
 
 from aicore.config import Settings, get_settings
 
@@ -114,7 +115,7 @@ def build_chat_model(settings: Settings | None = None) -> BaseChatModel:
         return ChatOpenAI(
             model=cfg.agent_model,
             base_url=cfg.openai_base_url,
-            api_key=cfg.openai_api_key,
+            api_key=SecretStr(cfg.openai_api_key),
             temperature=cfg.agent_temperature,
             timeout=cfg.llm_timeout_seconds,
             max_retries=cfg.llm_max_retries,

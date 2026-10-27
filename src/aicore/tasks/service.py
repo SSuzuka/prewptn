@@ -10,10 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import CursorResult, and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -288,7 +288,7 @@ class TaskService:
             # and re-read the row instead of syncing the identity map in Python.
             .execution_options(synchronize_session=False)
         )
-        if result.rowcount != 1:
+        if cast(CursorResult[Any], result).rowcount != 1:
             logger.warning("task.claim_rejected", task_id=str(task.id))
             return False
 
@@ -324,6 +324,78 @@ class TaskService:
         )
         return list(result.scalars().all())
 
+    async def list_stale_pending(
+        self, *, older_than_seconds: float | None = None, limit: int = 100
+    ) -> list[TaskRun]:
+        """PENDING-задачи, которые слишком долго не забрал ни один воркер.
+
+        Штатно PENDING живёт миллисекунды (создание → очередь → claim) либо
+        ждёт отложенный ретрай не дольше `task_retry_max_exponent_delay`.
+        Если процесс `taskiq scheduler` не запущен, задача остаётся PENDING
+        навсегда; этот список — safety net для такого случая.
+        """
+        cfg = get_settings()
+        threshold = (
+            cfg.task_pending_sweep_seconds if older_than_seconds is None else older_than_seconds
+        )
+        cutoff = utcnow() - timedelta(seconds=threshold)
+        oldest = utcnow() - timedelta(seconds=cfg.task_pending_max_age_seconds)
+        result = await self.session.execute(
+            select(TaskRun)
+            .where(
+                TaskRun.status == TaskStatus.PENDING,
+                TaskRun.queued_at.is_not(None),
+                TaskRun.queued_at < cutoff,
+                # Не воскрешаем задачи, брошенные недели назад: они уже не
+                # «застряли из-за минутного сбоя», а забыты.
+                TaskRun.queued_at >= oldest,
+            )
+            .order_by(TaskRun.queued_at)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def list_expired_pending(
+        self, *, max_age_seconds: float | None = None, limit: int = 100
+    ) -> list[TaskRun]:
+        """PENDING-задачи, которые заброшены дольше `task_pending_max_age_seconds`.
+
+        Их бессмысленно переставлять в очередь (см. `list_stale_pending`), но
+        оставлять навсегда в PENDING тоже нельзя: `/retry` принимает только
+        FAILED/DEAD_LETTER, поэтому такую строку нельзя было ни увидеть в
+        списке dead-letter, ни перезапустить вручную. Sweeper переводит их в
+        DEAD_LETTER.
+        """
+        cfg = get_settings()
+        max_age = cfg.task_pending_max_age_seconds if max_age_seconds is None else max_age_seconds
+        cutoff = utcnow() - timedelta(seconds=max_age)
+        result = await self.session.execute(
+            select(TaskRun)
+            .where(
+                TaskRun.status == TaskStatus.PENDING,
+                TaskRun.queued_at.is_not(None),
+                TaskRun.queued_at < cutoff,
+            )
+            .order_by(TaskRun.queued_at)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def mark_pending_requeued(self, task: TaskRun) -> bool:
+        """Сдвинуть `queued_at`, чтобы pending-sweeper не спамил повторами.
+
+        Условный UPDATE: если задачу уже забрал воркер (статус сменился), не
+        трогаем её. Возвращает True, если строка всё ещё была PENDING.
+        """
+        result = await self.session.execute(
+            update(TaskRun)
+            .where(TaskRun.id == task.id, TaskRun.status == TaskStatus.PENDING)
+            .values(queued_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.refresh(task)
+        return cast(CursorResult[Any], result).rowcount == 1
+
     async def mark_lease_expired(self, task: TaskRun) -> TaskRun:
         """Увести просроченную RUNNING-задачу без попыток в DEAD_LETTER.
 
@@ -342,9 +414,34 @@ class TaskService:
             .execution_options(synchronize_session=False)
         )
         await self.session.refresh(task)
-        if result.rowcount == 1:
+        if cast(CursorResult[Any], result).rowcount == 1:
             record_task_status(task.task_type, task.status.value)
             logger.error("task.lease_expired_dead_letter", task_id=str(task.id))
+        return task
+
+    async def mark_pending_expired(self, task: TaskRun) -> TaskRun:
+        """Увести заброшенную PENDING-задачу в DEAD_LETTER.
+
+        PENDING старше `task_pending_max_age_seconds` уже не переставляется в
+        очередь (это не минутный сбой, а забытая работа). Раньше такая строка
+        оставалась PENDING навсегда: без терминального статуса она не попадала
+        в dead-letter и не перезапускалась через `/retry`. Условный UPDATE не
+        перетирает статус, если воркер успел забрать задачу параллельно.
+        """
+        result = await self.session.execute(
+            update(TaskRun)
+            .where(TaskRun.id == task.id, TaskRun.status == TaskStatus.PENDING)
+            .values(
+                status=TaskStatus.DEAD_LETTER,
+                error="pending too long without being claimed",
+                finished_at=utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.refresh(task)
+        if cast(CursorResult[Any], result).rowcount == 1:
+            record_task_status(task.task_type, task.status.value)
+            logger.error("task.pending_expired_dead_letter", task_id=str(task.id))
         return task
 
     async def mark_succeeded(
@@ -402,6 +499,11 @@ class TaskService:
 
         if retryable and task.can_retry:
             task.status = TaskStatus.PENDING
+            # queued_at — время последней постановки в очередь, а не только
+            # создания. Pending-sweeper использует его, чтобы не переставить
+            # задачу, которая ждёт штатный backoff, и чтобы после аварийного
+            # re-enqueue не делать это на каждом цикле.
+            task.queued_at = utcnow()
             logger.warning(
                 "task.attempt_failed_will_retry",
                 task_id=str(task.id),
@@ -448,7 +550,7 @@ class TaskService:
             .execution_options(synchronize_session=False)
         )
         await self.session.refresh(task)
-        if result.rowcount == 1:
+        if cast(CursorResult[Any], result).rowcount == 1:
             record_task_status(task.task_type, task.status.value)
             logger.error("task.enqueue_failed", task_id=str(task.id), error=error)
         return task

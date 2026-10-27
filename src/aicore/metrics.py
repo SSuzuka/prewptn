@@ -8,7 +8,10 @@ risk of an import cycle.
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram
+import os
+
+from prometheus_client import CollectorRegistry, Counter, Histogram
+from prometheus_client.multiprocess import MultiProcessCollector
 
 # --- tasks ---------------------------------------------------------------
 TASKS_TOTAL = Counter(
@@ -88,6 +91,33 @@ RAG_FALLBACKS_TOTAL = Counter(
     "Retrievals that degraded to answering without context.",
     ["reason"],
 )
+
+
+# --- multiprocess -----------------------------------------------------------
+def multiprocess_registry() -> CollectorRegistry | None:
+    """Registry that aggregates worker processes when multiprocess mode is on.
+
+    Prometheus' multiprocess mode is enabled by setting
+    ``PROMETHEUS_MULTIPROC_DIR`` **before** this module is imported; each worker
+    then writes its counters/histograms to files in that directory instead of
+    process memory. A single exporter (worker or the dedicated metrics server)
+    reads them through ``MultiProcessCollector``, so with ``taskiq worker
+    --workers N`` counters from all N processes are visible instead of only the
+    one that won the :9100 bind.
+
+    The directory must be shared between the worker processes and the process
+    serving ``/metrics`` (same host or a mounted volume in Docker).
+    """
+    if not os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        return None
+    registry = CollectorRegistry()
+    try:
+        MultiProcessCollector(registry)
+    except (OSError, ValueError):
+        # Directory is set but missing/unreadable: fail soft and let the caller
+        # fall back to the in-process registry rather than 500 on /metrics.
+        return None
+    return registry
 
 
 def record_task_status(task_type: str, status: str) -> None:

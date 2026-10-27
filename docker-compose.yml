@@ -1,18 +1,28 @@
 # ============================================================================
-# Production-инфраструктура для aicore.
+# Инфраструктура и (опционально) приложение aicore.
 #
-# ВНИМАНИЕ: этот файл в текущем (MVP) состоянии НЕ запускается и НЕ отлажен.
-# По умолчанию проект работает полностью in-memory:
+# По умолчанию `docker compose up -d` поднимает только инфраструктуру:
+#     postgres, redis, qdrant
+# Сам проект умеет работать полностью in-memory:
 #     broker_backend=memory, sqlite, qdrant :memory:, llm=stub
 #
-# Чтобы перевести сервис в прод-режим, нужны:
-#   docker compose up -d postgres redis qdrant
-#   BROKER_BACKEND=redis  DB_URL=postgresql+asyncpg://...  VECTOR_BACKEND=qdrant
-#   uv sync --extra redis --extra postgres --extra openai --extra embeddings
+# Полный стек (миграции, API, worker, scheduler) — под профилем `app`:
+#   docker compose --profile app up -d --build
 #
-# Сервисы langfuse / prometheus / otel-collector закомментированы — они нужны
-# только для полного observability-стека и относятся к фазе 2.
+# Scheduler обязателен для отложенных ретраев. `--update-interval 1` уменьшает
+# квант задержки с 60 с до ~1 с; при большом числе расписаний это чаще сканирует
+# Redis, поэтому интервал можно поднять.
 # ============================================================================
+
+x-app-env: &app-env
+  DB_URL: postgresql+asyncpg://aicore:${POSTGRES_PASSWORD:-change-me-in-env}@postgres:5432/aicore
+  BROKER_BACKEND: redis
+  REDIS_URL: redis://redis:6379/0
+  VECTOR_BACKEND: qdrant
+  QDRANT_URL: http://qdrant:6333
+  LLM_BACKEND: ${LLM_BACKEND:-stub}
+  AGENT_BACKEND: ${AGENT_BACKEND:-stub}
+  WORKER_METRICS_HOST: 0.0.0.0
 
 services:
   postgres:
@@ -57,6 +67,82 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Приложение. По умолчанию выключено: включается профилем `app`.
+  # ---------------------------------------------------------------------------
+  migrate:
+    profiles: ["app"]
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    env_file: [".env"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    build: .
+    env_file: [".env"]
+    environment:
+      <<: *app-env
+      # Fail closed: без ключа API не должен подниматься на published-порту.
+      API_KEYS: ${API_KEYS:?set API_KEYS in .env}
+    ports:
+      # Loopback по умолчанию: наружу выставляйте осознанно, через прокси/TLS.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    profiles: ["app"]
+    build: .
+    command: ["taskiq", "worker", "aicore.broker:broker", "--workers", "2"]
+    env_file: [".env"]
+    environment:
+      <<: *app-env
+      # Все worker-процессы пишут сюда; один exporter отдаёт агрегат.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
+    ports:
+      # Один exporter на контейнер; при PROMETHEUS_MULTIPROC_DIR он отдаёт
+      # агрегат по всем worker-процессам. Только loopback: аутентификации нет.
+      - "127.0.0.1:9100:9100"
+    # tmpfs создаётся с нужным uid/gid, поэтому не зависим от владельца volume.
+    tmpfs:
+      - /tmp/prometheus:uid=1000,gid=1000,mode=0755
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    profiles: ["app"]
+    build: .
+    command:
+      - taskiq
+      - scheduler
+      - aicore.broker:scheduler
+      - --update-interval
+      - "1"
+    env_file: [".env"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # Фаза 2: наблюдаемость. Раскомментировать вместе с настройками в .env.

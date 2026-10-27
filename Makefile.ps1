@@ -28,16 +28,22 @@ uv sync --group dev                            # pytest, httpx
 # --- проверки --------------------------------------------------------------
 uv run python -c "import aicore; print('OK')"
 uv run pytest
-uv run ruff check src tests scripts
-uv run ruff format --check src tests scripts
+uv run ruff check src tests scripts migrations
+uv run ruff format --check src tests scripts migrations
+uv run alembic upgrade head
+uv run alembic downgrade base
+uv run alembic upgrade head
 
 # --- запуск ----------------------------------------------------------------
+docker compose up -d                           # postgres + redis + qdrant
+docker compose --profile app up -d --build     # migrate + api + worker + scheduler
 uv run python scripts/demo.py                  # демо: конфиг, логи, health-check
 uv run python scripts/check_stage1.py          # проверка config + logging
 uv run python scripts/check_stage2.py          # проверка БД, брокера, retries, DLQ
 uv run python scripts/check_server.py          # поднимает uvicorn и бьёт по API
 uv run uvicorn aicore.api.app:app --reload     # API на 127.0.0.1:8000
 uv run taskiq worker aicore.broker:broker      # воркер (прод-режим)
+uv run taskiq scheduler aicore.broker:scheduler --update-interval 1  # backoff
 
 # --- git -------------------------------------------------------------------
 git add -A

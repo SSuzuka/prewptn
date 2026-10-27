@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Response
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
 from aicore.api.deps import rate_limit
+from aicore.metrics import multiprocess_registry
 
 router = APIRouter()
 
@@ -16,4 +17,5 @@ router = APIRouter()
     summary="Prometheus-метрики (latency, счётчики, стоимость)",
 )
 def metrics() -> Response:
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    registry = multiprocess_registry() or REGISTRY
+    return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)

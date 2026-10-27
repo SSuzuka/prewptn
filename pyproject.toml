@@ -61,6 +61,7 @@ dev = [
     "httpx>=0.27,<0.29",
     "ruff>=0.8,<1",
     "pytest-asyncio>=0.24,<2",
+    "mypy>=1.11,<2",
 ]
 
 [build-system]
@@ -89,3 +90,10 @@ select = ["E", "F", "I", "UP", "B"]
 # Markdown не форматируем: в README python-блоки намеренно выровнены по колонкам
 # для читаемости, а ruff снимает любое ручное выравнивание.
 exclude = ["*.md"]
+
+[tool.mypy]
+# numpy's bundled stubs use PEP 695 `type` statements (3.12+), and mypy follows
+# them even with ignore_missing_imports. The project still supports 3.11; the
+# runtime matrix covers it, while mypy checks once against 3.12.
+python_version = "3.12"
+ignore_missing_imports = true

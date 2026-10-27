@@ -11,6 +11,7 @@ Redis, Qdrant и без LLM-ключа.
 from __future__ import annotations
 
 import os
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -155,8 +156,18 @@ class Settings(BaseSettings):
     task_lease_seconds: float = Field(default=300.0, gt=0)
     # Как часто фоновый purge-цикл ищет просроченные RUNNING-задачи.
     task_lease_sweep_interval_seconds: float = Field(default=30.0, gt=0)
-    # Префикс ключей Redis для отложенных ретраев (RedisScheduleSource).
-    task_retry_schedule_prefix: str = Field(default="aicore:retry-schedules")
+    # Safety net для PENDING, которые не подхватил ни воркер, ни scheduler
+    # (например, процесс taskiq scheduler не запущен). Порог намеренно больше
+    # максимальной задержки ретрая, чтобы не перебивать штатный backoff.
+    task_pending_sweep_seconds: float = Field(default=600.0, gt=0)
+    # Верхняя граница возраста для pending-sweeper: не воскрешаем задачи,
+    # брошенные недели назад (это может стоить денег на LLM/индексации).
+    task_pending_max_age_seconds: float = Field(default=172_800.0, gt=0)
+    # Префикс ключей Redis для отложенных ретраев (ListRedisScheduleSource).
+    # Двоеточия не поддерживаются: taskiq-redis парсит ключ как
+    # `{prefix}:time:{ISO}` через `split(":", 2)`, и префикс с `:` ломает
+    # восстановление просроченных расписаний. Старое значение нормализуется.
+    task_retry_schedule_prefix: str = Field(default="aicore-retry-schedules")
 
     # ----------------------------------------------------------------- API
     api_host: str = Field(default="127.0.0.1")
@@ -171,6 +182,14 @@ class Settings(BaseSettings):
     # Доверять ли X-Forwarded-For при определении клиента. Включать только за
     # доверенным прокси/ingress: иначе заголовок подделываем и лимит обходится.
     trust_proxy_headers: bool = Field(default=False)
+    # Сколько правых элементов X-Forwarded-For дописано доверенными прокси.
+    # 1 — один reverse proxy: клиентский адрес — самый правый элемент.
+    # 2 — два прокси: берём второй справа и т.д. Если цепочка короче, чем
+    # заявленное число прокси, доверять ей нельзя и используется адрес сокета.
+    trusted_proxy_count: int = Field(default=1, ge=1)
+    # Максимум одновременных SSE-потоков на процесс. Каждый поток опрашивает БД,
+    # поэтому без лимита клиент может выесть соединения и пул БД.
+    sse_max_concurrent_streams: int = Field(default=100, ge=1)
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:3000"]
     )
@@ -183,7 +202,10 @@ class Settings(BaseSettings):
     # процессе воркера, а `/metrics` отдаёт API-процесс: без этой ручки метрики
     # воркера не видны (в проде — вторая цель скрейпа на этом порту). 0 = выкл.
     worker_metrics_port: int = Field(default=9100, ge=0, le=65535)
-    worker_metrics_host: str = Field(default="0.0.0.0")
+    # По умолчанию только loopback: экспортёр не имеет аутентификации, и
+    # выставлять его в 0.0.0.0 без сетевой политики/прокси небезопасно.
+    # Для скрейпа из другого контейнера задайте WORKER_METRICS_HOST=0.0.0.0.
+    worker_metrics_host: str = Field(default="127.0.0.1")
 
     otel_service_name: str = Field(default="aicore")
     otel_exporter_otlp_endpoint: str | None = Field(default=None)
@@ -221,6 +243,32 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {allowed}, got {value!r}")
         return upper
 
+    @field_validator("task_retry_schedule_prefix")
+    @classmethod
+    def _validate_schedule_prefix(cls, value: str) -> str:
+        """Normalize prefixes that break taskiq-redis time-key parsing.
+
+        `ListRedisScheduleSource._parse_time_key` splits the key on the first
+        two colons: `{prefix}:time:{ISO}`. A colon inside the prefix makes the
+        remaining part `time:...` instead of an ISO timestamp, so past
+        schedules are silently never recovered. Legacy deployments may still
+        have the old default `aicore:retry-schedules`; translate it with a
+        warning instead of crashing startup, and use the safe prefix from now on.
+        """
+        if not value:
+            raise ValueError("task_retry_schedule_prefix must not be empty")
+        if ":" in value:
+            safe = value.replace(":", "-")
+            warnings.warn(
+                "task_retry_schedule_prefix contains ':'; taskiq-redis parses "
+                f"time keys with split(':', 2). Using {safe!r} instead of {value!r}. "
+                "Schedules stored under the old prefix are not recovered.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return safe
+        return value
+
     @model_validator(mode="after")
     def _validate_rag_chunking(self) -> Settings:
         """Overlap >= size would never advance and breaks the chunker.
@@ -247,6 +295,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "task_lease_seconds must be greater than task_timeout_seconds "
                 f"({self.task_lease_seconds} <= {self.task_timeout_seconds})"
+            )
+        if self.task_pending_sweep_seconds <= self.task_retry_max_exponent_delay:
+            raise ValueError(
+                "task_pending_sweep_seconds must be greater than "
+                "task_retry_max_exponent_delay, otherwise the safety net races "
+                "the normal backoff "
+                f"({self.task_pending_sweep_seconds} <= {self.task_retry_max_exponent_delay})"
+            )
+        if self.task_pending_max_age_seconds <= self.task_pending_sweep_seconds:
+            raise ValueError(
+                "task_pending_max_age_seconds must be greater than "
+                "task_pending_sweep_seconds "
+                f"({self.task_pending_max_age_seconds} <= {self.task_pending_sweep_seconds})"
             )
         return self
 

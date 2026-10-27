@@ -25,7 +25,7 @@ jobs:
       # Force uv to use the matrix interpreter for every step.
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -44,21 +44,51 @@ jobs:
       - name: Format check
         run: uv run ruff format --check src tests scripts migrations
 
+      - name: Type check
+        if: matrix.python-version == '3.12'
+        run: uv run mypy src
+
       - name: Tests
         run: uv run pytest
+
+  migrations:
+    name: alembic upgrade/downgrade (sqlite)
+    runs-on: ubuntu-latest
+    env:
+      DB_URL: sqlite+aiosqlite:///./ci-migrations.db
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      # Both directions: a broken downgrade is as dangerous as a broken upgrade.
+      - name: Upgrade to head
+        run: uv run alembic upgrade head
+
+      - name: Downgrade to base
+        run: uv run alembic downgrade base
+
+      - name: Upgrade again (enum/type recreation)
+        run: uv run alembic upgrade head
 
   docker:
     name: docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Build only (no push): catches Dockerfile errors on every PR.
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -69,20 +99,20 @@ jobs:
   # makes CD follow CI instead of racing it in a separate workflow.
   publish:
     name: publish image (GHCR)
-    needs: [test, docker]
+    needs: [test, migrations, docker]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -95,7 +125,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
@@ -105,7 +135,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true

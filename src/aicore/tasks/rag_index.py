@@ -120,11 +120,12 @@ async def _mark_document_failed(document_id: str, error: str) -> None:
         logger.exception("document.mark_failed_failed", document_id=document_id)
 
 
-async def enqueue_index_document(task_id: str) -> None:
+async def enqueue_index_document(task_id: str, *, mark_failed_on_error: bool = True) -> bool:
     """Поставить задачу индексации в брокер.
 
     `ensure_broker_started` внутри try: недоступный брокер не должен оставлять
-    задачу в PENDING навсегда.
+    задачу в PENDING навсегда. Returns ``False`` on transport failure so the
+    sweeper does not count a failed re-enqueue as reclaimed.
     """
     try:
         await ensure_broker_started()
@@ -132,4 +133,7 @@ async def enqueue_index_document(task_id: str) -> None:
     except Exception as exc:  # noqa: BLE001 — фиксируем в БД, а не только в логе
         logger.exception("task.enqueue_failed", task_id=task_id)
         record_enqueue_failed("index_document")
-        await mark_task_enqueue_failed(task_id, f"{type(exc).__name__}: {exc}")
+        if mark_failed_on_error:
+            await mark_task_enqueue_failed(task_id, f"{type(exc).__name__}: {exc}")
+        return False
+    return True

@@ -123,7 +123,7 @@ async def _with_rag(question: str) -> str:
     return build_rag_prompt(question, bundle)
 
 
-async def enqueue_answer_question(task_id: str) -> None:
+async def enqueue_answer_question(task_id: str, *, mark_failed_on_error: bool = True) -> bool:
     """Поставить задачу в брокер.
 
     На InMemoryBroker (dev) задача исполняется прямо здесь; на
@@ -132,6 +132,9 @@ async def enqueue_answer_question(task_id: str) -> None:
     `ensure_broker_started` внутри try: если Redis/сеть недоступны, startup
     падает так же, как и `kiq`, и задача должна быть помечена FAILED, а не
     остаться в PENDING навсегда.
+
+    Returns ``False`` when the broker call failed (the row is marked FAILED),
+    so the sweeper does not count a failed re-enqueue as reclaimed.
     """
     try:
         await ensure_broker_started()
@@ -139,4 +142,7 @@ async def enqueue_answer_question(task_id: str) -> None:
     except Exception as exc:  # noqa: BLE001 — фиксируем в БД, а не только в логе
         logger.exception("task.enqueue_failed", task_id=task_id)
         record_enqueue_failed("answer_question")
-        await mark_task_enqueue_failed(task_id, f"{type(exc).__name__}: {exc}")
+        if mark_failed_on_error:
+            await mark_task_enqueue_failed(task_id, f"{type(exc).__name__}: {exc}")
+        return False
+    return True

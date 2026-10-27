@@ -18,6 +18,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool, tool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from aicore.agents.tools import search_knowledge_base
 
@@ -29,7 +30,9 @@ KNOWLEDGE_SYSTEM_PROMPT = (
 )
 
 
-def build_knowledge_subagent(model: BaseChatModel, *, checkpointer: object = None) -> Runnable:
+def build_knowledge_subagent(
+    model: BaseChatModel, *, checkpointer: BaseCheckpointSaver | None = None
+) -> Runnable:
     """Build the RAG research subagent (model + retrieval tool).
 
     The subagent is invoked once per delegation, so it carries no checkpointer

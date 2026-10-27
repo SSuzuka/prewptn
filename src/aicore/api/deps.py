@@ -117,16 +117,18 @@ def _client_key(request: Request) -> str:
 
     `X-Forwarded-For` — это цепочка `client, proxy1, proxy2, ...`, куда КАЖДЫЙ
     узел дописывает источник справа. Клиент может подделать левые значения
-    (или весь заголовок), но правый элемент дописан доверенным прокси — только
-    ему и можно верить. Раньше брался левый (`split(",", 1)[0]`), и лимит
-    обходился запросами с разными фейковыми XFF.
+    (или весь заголовок), но правые элементы дописаны доверенными прокси.
+    `trusted_proxy_count` говорит, сколько таких элементов отбросить справа:
+    1 — один reverse proxy, 2 — два и т.д. Если цепочка короче, чем заявленное
+    число прокси, доверять ей нельзя и берём адрес сокета.
     """
-    if get_settings().trust_proxy_headers:
+    settings = get_settings()
+    if settings.trust_proxy_headers:
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
-            last = forwarded.rsplit(",", 1)[-1].strip()
-            if last:
-                return last
+            parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+            if len(parts) >= settings.trusted_proxy_count:
+                return parts[-settings.trusted_proxy_count]
     return request.client.host if request.client else "anonymous"
 
 

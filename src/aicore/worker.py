@@ -85,18 +85,40 @@ def _start_metrics_exporter(cfg: Settings) -> None:
 
     Counters for tasks and LLM calls are incremented in the worker process; the
     API's `/metrics` cannot see them. Prometheus scrapes this second target.
-    A bind conflict (several workers on one host) is non-fatal: we warn and
-    keep the worker running rather than crash it over an observability port.
+
+    With ``taskiq worker --workers N`` every process would try to bind the same
+    port, and only one would win. In Prometheus multiprocess mode
+    (``PROMETHEUS_MULTIPROC_DIR`` shared by all workers) all processes write to
+    the same files and the winner serves the aggregate, so no counters are lost.
+    Without that mode the conflict is non-fatal: we warn and keep the worker
+    running, but metrics from the other processes are not exposed.
     """
     global _metrics_server, _metrics_thread
     if cfg.worker_metrics_port <= 0 or _metrics_server is not None:
         return
-    from prometheus_client import start_http_server
+    from prometheus_client import start_http_server, start_wsgi_server
 
+    from aicore.metrics import multiprocess_registry
+
+    registry = multiprocess_registry()
     try:
-        result = start_http_server(cfg.worker_metrics_port, addr=cfg.worker_metrics_host)
+        if registry is not None:
+            result = start_wsgi_server(
+                cfg.worker_metrics_port,
+                addr=cfg.worker_metrics_host,
+                registry=registry,
+            )
+        else:
+            result = start_http_server(cfg.worker_metrics_port, addr=cfg.worker_metrics_host)
     except OSError as exc:
-        logger.warning("worker.metrics_exporter_bind_failed", error=str(exc))
+        logger.warning(
+            "worker.metrics_exporter_bind_failed",
+            error=str(exc),
+            hint=(
+                "with --workers N only one process can bind the port; set "
+                "PROMETHEUS_MULTIPROC_DIR to a shared directory for aggregated metrics"
+            ),
+        )
         return
 
     # prometheus-client >= 0.23 returns ``(httpd, thread)``; older versions

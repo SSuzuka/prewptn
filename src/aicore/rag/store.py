@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client import AsyncQdrantClient
@@ -90,7 +90,7 @@ class VectorStore:
             client = AsyncQdrantClient(
                 url=cfg.qdrant_url,
                 api_key=cfg.qdrant_api_key or None,
-                timeout=cfg.embedding_timeout_seconds,
+                timeout=max(1, int(cfg.embedding_timeout_seconds)),
             )
             logger.info(
                 "rag.store.qdrant_server", url=cfg.qdrant_url, collection=cfg.qdrant_collection
@@ -236,7 +236,7 @@ class VectorStore:
         await self.ensure_collection()
         await self._client.delete(
             collection_name=self._collection,
-            points_selector=point_ids,
+            points_selector=cast(list[Any], point_ids),
             wait=True,
         )
 

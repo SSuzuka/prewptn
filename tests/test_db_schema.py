@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 
 import pytest
 from sqlalchemy import text
 
+from aicore.config import Settings
 from aicore.db.session import Database
 from aicore.tasks.service import TaskService, latency_ms
 
@@ -22,6 +24,41 @@ class TestSchema:
     @pytest.mark.asyncio
     async def test_all_tables_created(self, db: Database) -> None:
         assert {"task_runs", "documents", "idempotency_keys"} <= await table_names(db)
+
+    @pytest.mark.asyncio
+    async def test_schema_ready_requires_document_content(self, db: Database) -> None:
+        assert await db.schema_ready() is True
+        async with db.engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE documents DROP COLUMN content"))
+        assert await db.schema_ready() is False
+
+    @pytest.mark.asyncio
+    async def test_sqlite_ensure_ready_adds_content_to_old_db(self, tmp_path) -> None:
+        dsn = f"sqlite+aiosqlite:///{tmp_path / 'old.db'}"
+        database = Database(Settings(db_url=dsn))
+        await database.ensure_ready()
+        async with database.engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE documents DROP COLUMN content"))
+        database._ready = False
+        await database.ensure_ready()
+        assert await database.schema_ready() is True
+        await database.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_ensure_ready_does_not_race(self, tmp_path) -> None:
+        """Fresh SQLite: 20 parallel first requests must all see the schema."""
+        dsn = f"sqlite+aiosqlite:///{tmp_path / 'race.db'}"
+        database = Database(Settings(db_url=dsn))
+
+        async def hit() -> None:
+            await database.ensure_ready()
+            async with database.session() as session:
+                await session.execute(text("SELECT count(*) FROM documents"))
+
+        results = await asyncio.gather(*(hit() for _ in range(20)), return_exceptions=True)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        await database.disconnect()
+        assert errors == []
 
     @pytest.mark.asyncio
     async def test_all_datetime_columns_are_timezone_aware(self) -> None:

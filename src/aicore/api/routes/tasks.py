@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
 
 from aicore.api.deps import rate_limit
 from aicore.api.schemas import TaskCreateRequest, TaskView
+from aicore.config import get_settings
 from aicore.db.session import get_session
 from aicore.logging import get_logger
 from aicore.streaming.events import stream_task_events
@@ -26,9 +28,58 @@ router = APIRouter()
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key", max_length=255)]
 
+# Ограничение одновременных SSE-потоков: каждый поток раз в 0.25 с открывает
+# сессию и делает SELECT. Без лимита один клиент может выесть пул БД.
+# Счётчик меняется без await, поэтому в одном event loop операции атомарны;
+# отдельный lock не нужен и только привязал бы модуль к конкретному loop.
+_active_streams = 0
+
+
+async def _acquire_stream_slot() -> bool:
+    global _active_streams
+    if _active_streams >= get_settings().sse_max_concurrent_streams:
+        return False
+    _active_streams += 1
+    return True
+
+
+async def _release_stream_slot() -> None:
+    global _active_streams
+    if _active_streams > 0:
+        _active_streams -= 1
+
+
+def reset_stream_slots() -> None:
+    """Сбросить счётчик (тесты)."""
+    global _active_streams
+    _active_streams = 0
+
+
+class _StreamSlot:
+    """Idempotent release: generator finally and response background may both run."""
+
+    def __init__(self) -> None:
+        self._released = False
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        await _release_stream_slot()
+
+
+async def _limited_events(task_id: str, slot: _StreamSlot) -> AsyncIterator[dict[str, str]]:
+    """Прокинуть события, гарантированно освободив слот при закрытии."""
+    try:
+        async for event in stream_task_events(task_id):
+            yield event
+    finally:
+        await slot.release()
+
+
 # Диспетчеризация ручного retry по типу задачи: каждый тип перезапускается
 # своим хендлером, иначе index_document ушёл бы в LLM-хендлер (и наоборот).
-_ENQUEUERS: dict[str, Callable[[str], Awaitable[None]]] = {
+_ENQUEUERS: dict[str, Callable[[str], Awaitable[bool]]] = {
     "answer_question": enqueue_answer_question,
     "index_document": enqueue_index_document,
     "run_agent": enqueue_run_agent,
@@ -89,7 +140,11 @@ async def get_task(task_id: str, session: SessionDep) -> TaskView:
     return TaskView.from_task(task)
 
 
-@router.post("/tasks/{task_id}/retry", summary="Ручной перезапуск упавшей задачи")
+@router.post(
+    "/tasks/{task_id}/retry",
+    dependencies=[Depends(rate_limit)],
+    summary="Ручной перезапуск упавшей задачи",
+)
 async def retry_task(task_id: str, session: SessionDep) -> TaskView:
     _require_uuid(task_id)
     svc = TaskService(session)
@@ -119,4 +174,16 @@ async def retry_task(task_id: str, session: SessionDep) -> TaskView:
 )
 async def stream_task(task_id: str) -> EventSourceResponse:
     _require_uuid(task_id)
-    return EventSourceResponse(stream_task_events(task_id))
+    slot = _StreamSlot()
+    if not await _acquire_stream_slot():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="too many concurrent streams",
+        )
+    # BackgroundTask runs even when the client disconnects before the generator's
+    # first __anext__ (an unstarted async generator's aclose() does not run
+    # finally), so the slot cannot leak.
+    return EventSourceResponse(
+        _limited_events(task_id, slot),
+        background=BackgroundTask(slot.release),
+    )

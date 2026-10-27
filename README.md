@@ -51,7 +51,7 @@ uv run uvicorn aicore.api.app:app --reload
 Всё проходит офлайн — без Docker, Redis, Postgres, Qdrant и LLM-ключа.
 
 ```bash
-uv run pytest                        # 306 тестов
+uv run pytest                        # 318 тестов
 uv run ruff check src tests scripts migrations  # линтер
 uv run ruff format --check src tests scripts migrations
 uv run python scripts/demo.py            # конфиг, логи, health-check
@@ -272,10 +272,12 @@ task_retry_delay_seconds:     float = 5.0
 task_retry_use_jitter:        bool  = True
 task_retry_use_exponent:      bool  = True    # экспоненциальный backoff
 task_retry_max_exponent_delay: float = 60.0   # потолок задержки
-task_retry_schedule_prefix:   str   = "aicore:retry-schedules"  # ключи Redis для отложенных ретраев
+task_retry_schedule_prefix:   str   = "aicore-retry-schedules"  # без ':': taskiq-redis режет ключ по первым двум ':'
 task_timeout_seconds:         float = 120.0
 task_lease_seconds:           float = 300.0  # > task_timeout_seconds: lease «живой» RUNNING-задачи
 task_lease_sweep_interval_seconds: float = 30.0  # период перезахвата просроченных RUNNING
+task_pending_sweep_seconds:   float = 600.0  # safety net для PENDING, если scheduler не запущен
+task_pending_max_age_seconds: float = 172800.0  # не воскрешать PENDING старше 2 суток
 
 # --- LLM ---
 llm_model:            str   = "gpt-4o-mini"
@@ -311,8 +313,10 @@ agent_max_threads:    int   = 256       # предел веток (thread_id) в
 api_host:  str = "127.0.0.1"
 api_port:  int = 8000
 api_rate_limit_per_minute: int = 60
-api_keys: list[str] = []                                # пусто = auth выключен; иначе X-API-Key
+api_keys: list[str] = []                                # пусто = auth выключен; compose app требует непустой
 trust_proxy_headers: bool = False                       # брать IP из X-Forwarded-For (за прокси)
+trusted_proxy_count: int = 1                            # сколько правых XFF-элементов дописали доверенные прокси
+sse_max_concurrent_streams: int = 100                   # лимит одновременных SSE-потоков на процесс
 cors_origins: list[str] = ["http://localhost:3000"]   # или строка через запятую
 
 # --- секреты (только из окружения, в коде не хардкодятся) ---
@@ -332,7 +336,7 @@ langfuse_secret_key:  str | None = None
 | `qdrant_collection` | `aicore_documents` | имя коллекции векторов |
 | `embedding_dim` | `384` | под конкретную модель эмбеддингов |
 | `worker_metrics_port` | `9100` | порт Prometheus-экспортёра воркера (`0` = выключен) |
-| `worker_metrics_host` | `0.0.0.0` | адрес привязки экспортёра воркера |
+| `worker_metrics_host` | `127.0.0.1` | адрес привязки экспортёра воркера (для скрейпа из другого контейнера — `0.0.0.0`) |
 | `openai_base_url` | `https://api.openai.com/v1` | совместимый endpoint / прокси |
 | `log_level` | `INFO` | отладка (`DEBUG`) |
 | `log_json` | `True` | `False` для читаемого вывода в dev |
@@ -368,25 +372,40 @@ middleware-хуков не вызывается. То есть при паден
 
 ```bash
 cp .env.example .env          # выставить prod-значения
-docker compose up -d          # postgres + redis + qdrant
-uv run alembic upgrade head   # миграции
+docker compose up -d          # только инфраструктура: postgres + redis + qdrant
+# либо весь стек (migrate + api + worker + scheduler):
+# профиль app требует непустой API_KEYS в .env (fail closed)
+docker compose --profile app up -d --build
+uv run alembic upgrade head   # миграции (если запускаете процессы вручную)
 uv run taskiq worker aicore.broker:broker          # воркер
-uv run taskiq scheduler aicore.broker:scheduler    # отложенные ретраи (backoff)
+uv run taskiq scheduler aicore.broker:scheduler --update-interval 1  # отложенные ретраи
 uv run uvicorn aicore.api.app:app --workers 4      # API
 ```
 
-> **Scheduler обязателен в проде.** Без процесса `taskiq scheduler` ретраи
-> происходят **немедленно**: middleware кладёт отложенную задачу в
-> `ListRedisScheduleSource`, но исполняет её именно планировщик. Отсутствие
-> scheduler'а = «3 попытки за 0,3 с» вместо backoff, то есть 429 от провайдера
-> сжигает все попытки почти сразу.
+> **Scheduler обязателен в проде.** Middleware кладёт отложенную задачу в
+> `ListRedisScheduleSource`, а исполняет её только процесс `taskiq scheduler`.
+> Без него задача остаётся в `PENDING` (а не «ретраится немедленно», как было
+> написано раньше: немедленный путь — это dev-ветка без `schedule_source`).
+> `--update-interval 1` важен: дефолтные 60 с квантуют задержку до минуты.
+> Если scheduler всё же не запущен, pending-sweeper вернёт задачу в очередь
+> после `task_pending_sweep_seconds` (по умолчанию 600 с) — это safety net, а
+> не замена backoff'у.
+>
+> **Префикс расписаний — без `:`.** `taskiq-redis` парсит ключ
+> `{prefix}:time:{ISO}` через `split(":", 2)`, поэтому дефолт
+> `aicore:retry-schedules` ломал восстановление просроченных расписаний.
+> Теперь дефолт `aicore-retry-schedules`, а `Settings` нормализует старый
+> префикс с двоеточием в дефис с предупреждением (старые расписания под
+> прежним ключом не восстанавливаются).
 >
 > **Метрики воркера.** Счётчики задач/LLM (`aicore_tasks_total`,
 > `aicore_llm_calls_total`, …) растут в процессе воркера, а `/metrics` отдаёт
 > API. Воркер поднимает собственный Prometheus-экспортёр на
-> `WORKER_METRICS_PORT` (по умолчанию `9100`) — добавьте его второй целью
-> скрейпа. Альтернатива для нескольких воркеров на одном хосте —
-> multiprocess-режим `prometheus_client` (фаза 2) или уникальный порт на процесс.
+> `WORKER_METRICS_PORT` (по умолчанию `9100`, host `127.0.0.1`). Для
+> `taskiq worker --workers N` включите multiprocess-режим: задайте общий
+> `PROMETHEUS_MULTIPROC_DIR` (в compose это tmpfs на worker), тогда
+> один победивший процесс отдаёт агрегат по всем N, а не только свои счётчики.
+> Без него конфликт порта логируется, но данные остальных процессов теряются.
 
 В `.env` для прода:
 
@@ -420,14 +439,15 @@ uv sync --extra embeddings # fastembed (ONNX): бесплатные локаль
 
 ## CI/CD (GitHub Actions)
 
-Один workflow `.github/workflows/ci.yml` с тремя джобами; порядок задаётся через
+Один workflow `.github/workflows/ci.yml` с четырьмя джобами; порядок задаётся через
 `needs`, поэтому публикация образа не может обогнать тесты.
 
 | Job | Триггер | Что делает |
 |---|---|---|
-| `test` | push, PR | `ruff check`, `ruff format --check` (src/tests/scripts/migrations), `pytest` на Python 3.11, 3.12 и 3.13 (офлайн) |
+| `test` | push, PR | `ruff check`, `ruff format --check`, `mypy` (3.12), `pytest` на Python 3.11, 3.12 и 3.13 (офлайн) |
+| `migrations` | push, PR | `alembic upgrade head` → `downgrade base` → `upgrade head` на SQLite |
 | `docker` | push, PR | сборка `Dockerfile` без пуша — ловит ошибки образа на PR |
-| `publish` | push в `main`/теги, `needs: [test, docker]` | собирает и пушит образ в GHCR |
+| `publish` | push в `main`/теги, `needs: [test, migrations, docker]` | собирает и пушит образ в GHCR |
 
 Почему так: отдельные workflow с одним триггером GitHub запускает **параллельно** —
 между файлами нет зависимостей, и CD мог опубликовать образ раньше (или вопреки)
@@ -551,10 +571,15 @@ prompt_per_1k, completion_per_1k)` — единственная точка ра�
 **Ограничение dev-режима ретраев.** `SmartRetryMiddleware` переставляет задачу
 через `schedule_source` с меткой `delay`. В проде брокеру передаётся
 `ListRedisScheduleSource`, и отложенную доставку исполняет процесс
-`taskiq scheduler` — без него задержка игнорируется и ретрай идёт немедленно.
-В dev `InMemoryBroker` не умеет отложенную доставку, поэтому backoff/jitter
+`taskiq scheduler`; без него задача остаётся в `PENDING` (немедленный ретрай —
+это ветка без `schedule_source`, то есть dev/InMemory). `--update-interval 1`
+убирает 60-секундный квант задержки. Префикс расписаний не должен содержать
+`:`, иначе taskiq-redis не восстанавливает просроченные ключи. В dev
+`InMemoryBroker` не умеет отложенную доставку, поэтому backoff/jitter
 фактически no-op. Источник правды о лимите попыток — БД (`TaskRun.max_attempts`),
-middleware-счётчик служит предохранителем на стороне брокера.
+middleware-счётчик служит предохранителем на стороне брокера. Pending-sweeper
+(`task_pending_sweep_seconds`, по умолчанию 600 с) — только safety net на случай,
+если scheduler не запущен или сообщение потерялось.
 
 **Lease против «навсегда RUNNING» после падения воркера.** Атомарный claim
 (`UPDATE ... WHERE status='pending'`) защищает от двойной оплаты, но у него был
@@ -573,14 +598,21 @@ middleware-счётчик служит предохранителем на ст�
 инкрементируются в процессе воркера, а `/metrics` отдаёт API-процесс — раньше
 `aicore_tasks_total` и `aicore_llm_calls_total` не появлялись ни в одном скрейпе.
 Воркер поднимает собственный Prometheus-экспортёр на `worker_metrics_port`
-(по умолчанию 9100; `0` выключает). Конфликт порта при нескольких воркерах на
-хосте не фатален: логируется предупреждение, процесс продолжает работу.
+(по умолчанию 9100; `0` выключает; host по умолчанию `127.0.0.1`, чтобы не
+выставлять порт без аутентификации). При `--workers N` включите
+`PROMETHEUS_MULTIPROC_DIR` (общий каталог; в compose — tmpfs на worker): тогда один процесс отдаёт
+агрегат по всем N, а не только свои счётчики. Без multiprocess-режима конфликт
+порта не фатален (warning), но данные остальных процессов теряются.
 
-**`/ready` действительно проверяет БД.** Раньше эндпоинт всегда отвечал
+**`/ready` действительно проверяет схему.** Раньше эндпоинт всегда отвечал
 `ready`, даже если БД недоступна или миграции не накатаны, и оркестратор слал
 трафик в инстанс, падавший на первом запросе. Теперь `/ready` делает
-`SELECT 1` **и** читает `task_runs`: без схемы — 503. Это ловит «подняли API,
-забыли `alembic upgrade head`».
+`SELECT 1` **и** читает `task_runs`, `documents` (`content`) и
+`idempotency_keys` (`request_fingerprint`): без схемы или поздних колонок — 503.
+Это ловит «подняли API, забыли `alembic upgrade head`». Для старого dev-SQLite
+`ensure_ready()` дополнительно добавляет известную аддитивную колонку
+`documents.content` (dev-only shim; prod-схему двигает только Alembic), чтобы
+локальный файл не падал с 500.
 
 **Не-ASCII `X-API-Key` — это 401, а не 500.** `secrets.compare_digest` для
 `str` требует ASCII-only и на ключе вроде `café` бросал `TypeError`. Сравниваем
@@ -590,8 +622,32 @@ middleware-счётчик служит предохранителем на ст�
 **`X-Forwarded-For`: доверяем правому адресу.** В цепочке `client, proxy1, ...`
 каждый узел дописывает источник справа. Левые адреса задаёт клиент, поэтому
 брать `split(",", 1)[0]` (как было раньше) — значит позволять обойти rate limit
-подделкой заголовка. Теперь берётся последний элемент — тот, что дописал
-ближайший доверенный прокси.
+подделкой заголовка. Теперь берётся элемент, отстоящий от конца на
+`trusted_proxy_count` (по умолчанию 1 — последний, его дописал ближайший
+доверенный прокси). Если цепочка короче заявленного числа прокси, заголовку не
+доверяем и используем адрес сокета.
+
+**SSE ограничен по числу потоков.** Каждый поток раз в 0.25 с открывает сессию
+и делает `SELECT`; без лимита один клиент может выесть пул БД. Сверх
+`sse_max_concurrent_streams` (по умолчанию 100 на процесс) эндпоинт отдаёт 503,
+а слот освобождается в `finally` при закрытии потока.
+
+**Pending-sweeper — safety net, не замена backoff.** Если `taskiq scheduler` не
+запущен или сообщение потерялось, PENDING-задача старше
+`task_pending_sweep_seconds` переставляется в очередь воркером. Порог (600 с)
+намеренно больше максимальной задержки ретрая, чтобы не перебивать штатный
+backoff; после перестановки `queued_at` сдвигается, поэтому повторного спама
+каждые 30 с нет. Задачи старше `task_pending_max_age_seconds` (2 суток) не
+воскрешаются: это уже не минутный сбой, а забытая работа, которую нельзя
+бездумно отправлять в LLM/индексацию. Вместо вечного PENDING такая строка
+переводится в DEAD_LETTER (с ошибкой `pending too long without being claimed`),
+поэтому она видна в dead-letter и доступна для ручного `/retry`. Ошибка брокера
+при re-enqueue не переводит строку в FAILED — она остаётся PENDING до
+следующего цикла.
+
+**Инициализация БД сериализована.** `ensure_ready()` держит `asyncio.Lock` на
+`connect + create_all`; иначе `_engine` публиковался раньше готовой схемы и
+15–95% первых параллельных запросов на свежем SQLite падали с `no such table`.
 
 **Текст документа хранится на строке `Document`, а не в payload задачи.**
 До 1 МБ текста ехало в сообщении очереди (Redis) и в JSONB `task_runs.payload`
@@ -704,8 +760,9 @@ LangChain `BaseChatModel`; чтобы граф (модель → tools → мо�
 ставится чистым ASGI-мидлварем (не `BaseHTTPMiddleware` — тот ломает SSE):
 берётся из `X-Correlation-ID`/`X-Request-ID` или генерируется и возвращается
 в заголовке. Rate limit стоит на всех `/v1`-эндпоинтах, включая чтение и SSE;
-за доверенным прокси (`trust_proxy_headers=true`) клиент берётся из **правого**
-адреса `X-Forwarded-For` (его дописал прокси, левые задаёт клиент).
+за доверенным прокси (`trust_proxy_headers=true`) клиент берётся из
+`X-Forwarded-For` со сдвигом `trusted_proxy_count` от конца (по умолчанию 1 —
+последний адрес; левые задаёт клиент).
 
 ---
 
@@ -747,10 +804,10 @@ uop/
 ├── uv.lock                          ✅ фиксация точных версий
 ├── .env.example                     ✅ все переключатели с комментариями
 ├── .gitignore                       ✅
-├── docker-compose.yml               ✅ лежит, но в MVP не запускается (см. комментарий в файле)
+├── docker-compose.yml               ✅ инфраструктура; профиль `app` — migrate/API/worker/scheduler
 ├── alembic.ini                      ✅ конфиг миграций (DSN берётся из настроек)
 ├── migrations/                      ✅ Alembic: env.py (async) + versions/
-├── Dockerfile                       ✅ образ API+воркер (сборка в GHCR)
+├── Dockerfile                       ✅ образ API/worker/scheduler (сборка в GHCR)
 ├── .dockerignore                    ✅
 ├── .github/workflows/               ✅ ci.yml: test → docker build → publish (GHCR)
 ├── Makefile.ps1                     ✅ шпаргалка по командам
